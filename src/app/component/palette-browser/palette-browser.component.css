@@ -73,3 +73,7 @@ h4 { margin: 8px 0 4px; padding: 3px; border-bottom: 1px solid var(--palette-bor
 .drop-end { padding: 5px; margin: 4px 0; border: 1px dashed var(--palette-border); color: var(--palette-muted); font-size: 11px; text-align: center; }
 .empty-line { min-height: 18px; }
 .editor .insert-option input { display: inline-block; width: auto; }
+
+.wrap-option { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.wrap-option input { width: auto; margin: 0; }
+.no-wrap .line, .no-wrap .fold { white-space: nowrap; overflow-wrap: normal; overflow: hidden; text-overflow: ellipsis; }

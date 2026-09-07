@@ -16,6 +16,18 @@ export class PaletteBrowserComponent implements OnChanges, DoCheck, OnDestroy {
   dropHint: { key: string; position: number; source: string; placement: string; label: string } = null;
   insertInside = false;
   private suppressClickUntil = 0;
+  private static wrapPreference: boolean;
+  get wrapLines(): boolean {
+    if (PaletteBrowserComponent.wrapPreference === undefined) {
+      try { PaletteBrowserComponent.wrapPreference = localStorage.getItem('lycoris-palette-wrap-v1') !== 'false'; }
+      catch (_) { PaletteBrowserComponent.wrapPreference = true; }
+    }
+    return PaletteBrowserComponent.wrapPreference;
+  }
+  set wrapLines(value: boolean) {
+    PaletteBrowserComponent.wrapPreference = value;
+    try { localStorage.setItem('lycoris-palette-wrap-v1', String(value)); } catch (_) {}
+  }
   query = '';
   active = -2; // all; -1 is the implicit common section
   selected = -1;

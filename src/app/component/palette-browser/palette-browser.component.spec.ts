@@ -20,6 +20,39 @@ describe('Structured palette compatibility and editor', () => {
   afterEach(() => { localStorage.removeItem('lycoris-palette-view:' + palette.identifier); fixture.destroy(); });
   const button = (root: HTMLElement, label: string): HTMLButtonElement => Array.from(root.querySelectorAll('button')).find(b => b.textContent.trim() === label) as HTMLButtonElement;
 
+
+  it('switches long entries to one visual row without changing double-click payloads', () => {
+    const text = 'フェアリーウィッシュ ' + '魔法の説明'.repeat(60) + '\\n:MP-3';
+    palette.value = text;
+    const root = fixture.nativeElement as HTMLElement;
+    root.style.width = '280px';
+    component.wrapLines = true; fixture.detectChanges();
+    const line = root.querySelector('.line') as HTMLElement;
+    const wrappedHeight = line.getBoundingClientRect().height;
+    (root.querySelector('.wrap-option input') as HTMLInputElement).click();
+    fixture.detectChanges();
+    expect(component.wrapLines).toBeFalse();
+    expect(getComputedStyle(line).whiteSpace).toBe('nowrap');
+    expect(line.getBoundingClientRect().height).toBeLessThan(wrappedHeight);
+    expect(line.scrollWidth).toBeGreaterThan(line.clientWidth);
+    expect(line.title).toBe(text);
+    const sent = spyOn(component.sendLine, 'emit');
+    line.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    expect(sent).toHaveBeenCalledWith(text);
+    expect(palette.value).toBe(text);
+    component.wrapLines = true;
+  });
+  it('persists the display preference locally and shares it between palette views', () => {
+    component.wrapLines = false;
+    expect(localStorage.getItem('lycoris-palette-wrap-v1')).toBe('false');
+    const other = TestBed.createComponent(PaletteBrowserComponent);
+    try {
+      expect(other.componentInstance.wrapLines).toBeFalse();
+      other.componentInstance.wrapLines = true;
+      expect(component.wrapLines).toBeTrue();
+      expect(palette.value).toBe(source);
+    } finally { other.destroy(); }
+  });
   it('retains plain source, variable definitions and nested bodies without changing the palette', () => {
     const doc = parsePaletteDocument(source);
     expect(doc.tabs.map(t => t.name)).toEqual(['共通', '戦闘', '会話']);
