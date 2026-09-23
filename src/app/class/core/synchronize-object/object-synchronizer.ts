@@ -4,6 +4,7 @@ import { markForChanged } from './object-event-extension';
 import { ObjectFactory } from './object-factory';
 import { CatalogItem, ObjectStore } from './object-store';
 import { SynchronizeRequest, SynchronizeTask } from './synchronize-task';
+import { Logger } from '../system/util/logger';
 
 type PeerId = string;
 type ObjectIdentifier = string;
@@ -23,11 +24,16 @@ export class ObjectSynchronizer {
 
   initialize() {
     this.destroy();
-    console.log('ObjectSynchronizer ready...');
+    Logger.debug('ObjectSynchronizer ready...');
     EventSystem.register(this)
       .on('CONNECT_PEER', 2, event => {
         if (!event.isSendFromSelf) return;
-        console.log('CONNECT_PEER GameRoomService !!!', event.data.peerId);
+        Logger.debug('CONNECT_PEER GameRoomService !!!', event.data.peerId);
+        // InitialRoomSync negotiates a single ZIP snapshot first.  A legacy
+        // catalog is sent only when that negotiation explicitly falls back.
+      })
+      .on('INITIAL_ROOM_SYNC_FALLBACK', event => {
+        if (!event.isSendFromSelf || !event.data?.peerId) return;
         this.sendCatalog(event.data.peerId);
       })
       .on('DISCONNECT_PEER', event => {
@@ -35,7 +41,7 @@ export class ObjectSynchronizer {
       })
       .on<CatalogItem[]>('SYNCHRONIZE_GAME_OBJECT', event => {
         if (event.isSendFromSelf) return;
-        console.log('SYNCHRONIZE_GAME_OBJECT ' + event.sendFrom);
+        Logger.debug('SYNCHRONIZE_GAME_OBJECT ' + event.sendFrom);
         let catalog: CatalogItem[] = event.data;
         for (let item of catalog) {
           if (ObjectStore.instance.isDeleted(item.identifier)) {
@@ -88,7 +94,7 @@ export class ObjectSynchronizer {
   private createObject(context: ObjectContext): GameObject {
     let newObject: GameObject = ObjectFactory.instance.create(context.aliasName, context.identifier);
     if (!newObject) {
-      console.warn(context.aliasName + ' is Unknown...?', context);
+      Logger.warn(context.aliasName + ' is Unknown...?', context);
       return;
     }
     ObjectStore.instance.add(newObject, false);
@@ -150,7 +156,7 @@ export class ObjectSynchronizer {
     }
 
     task.ontimeout = (task, remainedRequests) => {
-      console.log('GameObject synchronize タイムアウト');
+      Logger.debug('GameObject synchronize タイムアウト');
       remainedRequests.forEach(request => this.requestMap.set(request.identifier, request));
     }
   }

@@ -2,6 +2,7 @@ import { EventSystem } from '../system';
 import { ResettableTimeout } from '../system/util/resettable-timeout';
 import { ImageContext, ImageFile, ImageState } from './image-file';
 import { ServerMediaStorage } from './server-media-storage';
+import { Logger } from '../system/util/logger';
 
 export type CatalogItem = { readonly identifier: string, readonly state: number };
 
@@ -13,6 +14,8 @@ export class ImageStorage {
   }
 
   private imageHash: { [identifier: string]: ImageFile } = {};
+  /** サーバーに存在しないことが確定した画像identifier */
+  readonly missingOnServer: Set<string> = new Set();
 
   get images(): ImageFile[] {
     let images: ImageFile[] = [];
@@ -22,13 +25,21 @@ export class ImageStorage {
     return images;
   }
 
-  private lazyTimer: ResettableTimeout;
+  private lazyTimer!: ResettableTimeout;
 
   private constructor() {
-    console.log('ImageStorage ready...');
+    Logger.debug('ImageStorage ready...');
+    EventSystem.register(this)
+      .on('SERVER_MEDIA_MISSING', event => {
+        if (event.data?.kind === 'image' && event.data?.identifier) {
+          this.missingOnServer.add(event.data.identifier);
+          Logger.debug(`[ImageStorage] marked missing on server: ${event.data.identifier}`);
+        }
+      });
   }
 
   private destroy() {
+    EventSystem.unregister(this);
     for (let identifier in this.imageHash) {
       this.delete(identifier);
     }
@@ -58,6 +69,19 @@ export class ImageStorage {
     return this._add(image);
   }
 
+  /** Replace an existing identifier's bytes instead of merge-filling empty fields. */
+  replace(context: ImageContext): ImageFile {
+    const image = this.imageHash[context.identifier];
+    if (!image) return this.add(context);
+
+    image.replace(context);
+    if (ImageState.COMPLETE <= image.state) {
+      this.lazySynchronize(100);
+      ServerMediaStorage.uploadImage(image);
+    }
+    return image;
+  }
+
   private _add(image: ImageFile): ImageFile {
     if (ImageState.COMPLETE <= image.state) {
       this.lazySynchronize(100);
@@ -69,7 +93,7 @@ export class ImageStorage {
       return stored;
     }
     this.imageHash[image.identifier] = image;
-    console.log('add Image: ' + image.identifier);
+    Logger.debug('add Image: ' + image.identifier);
     return image;
   }
 
@@ -100,15 +124,17 @@ export class ImageStorage {
     return false;
   }
 
-  get(identifier: string): ImageFile {
+  get(identifier: string, autoFetch: boolean = true): ImageFile {
     let image: ImageFile = this.imageHash[identifier];
     if (image) return image;
     if (/^[a-f0-9]{64}$/i.test(identifier || '')) {
       image = ImageFile.createEmpty(identifier);
       this.imageHash[identifier] = image;
-      ServerMediaStorage.fetchImage(identifier).then(fetched => {
-        if (fetched) this.add(fetched);
-      });
+      if (autoFetch) {
+        ServerMediaStorage.fetchImageOrNull(identifier).then(fetched => {
+          if (fetched) this.add(fetched);
+        });
+      }
       return image;
     }
     return null;

@@ -1,4 +1,5 @@
 import { Component, OnDestroy, OnInit } from '@angular/core';
+import { Logger } from '../../class/core/system/util/logger';
 
 import { ChatTab } from '@udonarium/chat-tab';
 import { ChatTabList } from '@udonarium/chat-tab-list';
@@ -84,13 +85,8 @@ export class ChatTabSettingComponent implements OnInit, OnDestroy {
   }
 
   onChangeSystemTab(){
-    if (!this.selectedTab ){
-      this.chatTabList.systemMessageTabIndex = 0;
-    }else{
-      const parentElement = this.selectedTab.parent;
-      const index: number = parentElement.children.indexOf(this.selectedTab);
-      this.chatTabList.systemMessageTabIndex = index;
-    }
+    const chatTab = this.selectedTab || this.chatTabs[0] || null;
+    this.chatTabList.setSystemMessageTab(chatTab);
   }
 
   create() {
@@ -137,7 +133,7 @@ export class ChatTabSettingComponent implements OnInit, OnDestroy {
     let fileName: string = this.roomName + '_log_' + this.selectedTab.name;
     let fileName_: string = this.appendTimestamp( fileName ) ;
 
-    console.log("this.modeCocLog:" +this.modeCocLog);
+    Logger.debug("this.modeCocLog:" +this.modeCocLog);
 
     if (this.modeCocLog){
       this.saveDataService.saveHtmlChatLogCoc(this.selectedTab, fileName_);
@@ -151,7 +147,7 @@ export class ChatTabSettingComponent implements OnInit, OnDestroy {
     let fileName: string = this.roomName + '_log_' + '全タブ';
     let fileName_: string = this.appendTimestamp( fileName ) ;
 
-    console.log("this.modeCocLog:" +this.modeCocLog);
+    Logger.debug("this.modeCocLog:" +this.modeCocLog);
 
     if (this.modeCocLog){
       this.saveDataService.saveHtmlChatLogAllCoc( fileName_);
@@ -172,6 +168,7 @@ export class ChatTabSettingComponent implements OnInit, OnDestroy {
         this.systemTabIndex --;
       }
       this.chkSystemTabIndex();
+      this.chatTabList.setSystemMessageTab(this.chatTabList.systemMessageTab);
     }
   }
 

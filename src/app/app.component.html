@@ -1,6 +1,29 @@
 <div id="app-table-layer" style="position: absolute; width: 100%; height: 100%; overflow: hidden;">
   <game-table></game-table>
 </div>
+
+<!-- 初期ルーム同期・メディア一括ダウンロード中表示 -->
+<div *ngIf="isBundleLoading" class="bundle-loading-overlay" aria-busy="true">
+  <div class="bundle-loading-card" #bundleLoadingCard tabindex="-1"
+       role="dialog" aria-modal="true"
+       aria-labelledby="bundle-loading-title" aria-describedby="bundle-loading-detail bundle-loading-hint">
+    <div class="bundle-loading-spinner" aria-hidden="true"></div>
+    <div id="bundle-loading-title" class="bundle-loading-text"
+         role="status" aria-live="polite" aria-atomic="true">{{ bundleLoadingText }}</div>
+    <div id="bundle-loading-detail" class="bundle-loading-detail">{{ bundleLoadingDetail }}</div>
+    <div class="bundle-loading-progress" role="progressbar"
+         aria-label="同期の進捗" [attr.aria-valuetext]="bundleLoadingProgressText"
+         [class.is-indeterminate]="bundleProgressPercent == null"
+         [attr.aria-valuemin]="bundleProgressPercent == null ? null : 0"
+         [attr.aria-valuemax]="bundleProgressPercent == null ? null : 100"
+         [attr.aria-valuenow]="bundleProgressAriaValue">
+      <div class="bundle-loading-bar"
+           [style.width.%]="bundleProgressPercent == null ? 35 : bundleProgressPercent"></div>
+    </div>
+    <div class="bundle-loading-count">{{ bundleLoadingProgressText }}</div>
+    <div id="bundle-loading-hint" class="bundle-loading-hint">完了するまで、この画面を閉じずにお待ちください。</div>
+  </div>
+</div>
 <div *ngIf="developerAnnouncementText" class="developer-announcement" [class.danger]="developerAnnouncementLevel === 'danger'">
   <span>{{ developerAnnouncementText }}</span>
   <button type="button" (click)="developerAnnouncementText = ''">×</button>
@@ -49,7 +72,7 @@
       <li (click)="open('LightingPanelComponent')" [class.options-active]="isLightingPanelOpen">
         <a routerLink="/" routerLinkActive="active">
           <div><i class="material-icons">lightbulb</i></div>
-          <div>{{ isLightingPanelOpen ? '照明視覚中' : '照明視覚' }}</div>
+          <div>照明・視界</div>
         </a>
       </li>
       <li (click)="open('InitiativePanelComponent')" [class.options-active]="isInitiativePanelOpen" *ngIf="isAdvancedRoom">
@@ -67,13 +90,13 @@
       <li (click)="open('OptionsPanelComponent')" [class.options-active]="isOptionsPanelOpen">
         <a routerLink="/" routerLinkActive="active">
           <div><i class="material-icons">settings</i></div>
-          <div>{{ isOptionsPanelOpen ? 'オプション中' : 'オプション' }}</div>
+          <div>オプション</div>
         </a>
       </li>
       <li *ngIf="!isSaveing" (click)="save()">
         <a routerLink="/" routerLinkActive="active">
           <div><i class="material-icons">sd_storage</i></div>
-          <div>保存</div>
+          <div>卓をZIP保存</div>
         </a>
       </li>
       <li *ngIf="isSaveing" style="pointer-events: none;">
@@ -86,6 +109,7 @@
   </nav>
 </ui-panel>
 <dice-cutin></dice-cutin>
+<contested-roll-cutin></contested-roll-cutin>
 <initiative-tracker *ngIf="isAdvancedRoom"></initiative-tracker>
 <div #modalLayer></div>
 <macro-hotbar></macro-hotbar>

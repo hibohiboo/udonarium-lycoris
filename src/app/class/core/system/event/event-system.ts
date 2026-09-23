@@ -3,6 +3,7 @@ import { Event, EventContext } from './event';
 import { Listener } from './listener';
 import { Callback, EventMap } from './observer';
 import { Subject } from './subject';
+import { Logger } from '../util/logger';
 
 type EventName = string;
 
@@ -18,7 +19,7 @@ export class EventSystem implements Subject {
 
   private listenerMap: Map<EventName, Listener[]> = new Map();
   private constructor() {
-    console.log('EventSystem ready...');
+    Logger.debug('EventSystem ready...');
   }
 
   register(key: any): Listener {
@@ -146,9 +147,13 @@ export class EventSystem implements Subject {
       this.sendSystemMessage('<' + peerId + '> ' + errorMessage);
       this.trigger('NETWORK_ERROR', { peerId: peerId, errorType: errorType, errorMessage: errorMessage, errorObject: errorObject });
     }
+
+    callback.onPeerUnstable = (peerId, health) => {
+      this.trigger('PEER_UNSTABLE', { peerId: peerId, health: health });
+    }
   }
 
   private sendSystemMessage(message: string) {
-    console.log(message);
+    Logger.debug(message);
   }
 }

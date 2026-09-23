@@ -1,4 +1,7 @@
+import { PaletteBrowserComponent } from 'component/palette-browser/palette-browser.component';
+import { isPaletteCommand } from '@udonarium/palette-document';
 import { Component, ElementRef, HostBinding, NgZone, OnDestroy, OnInit, ViewChild } from '@angular/core';
+import { Logger } from '../../class/core/system/util/logger';
 
 import { ChatMessage, ChatMessageTargetContext } from '@udonarium/chat-message';
 import { ChatTab } from '@udonarium/chat-tab';
@@ -60,8 +63,9 @@ interface VnActor {
 })
 export class VnStageComponent implements OnInit, OnDestroy {
   @HostBinding('class.vn-has-front-pinned') get hasFrontPinnedSubPanel(): boolean { return this.paletteFrontPinned || this.logFrontPinned; }
-  @ViewChild('logScroll', { static: false }) logScrollEl: ElementRef;
-  @ViewChild('paletteScroll', { static: false }) paletteScrollEl: ElementRef;
+  @ViewChild('logScroll', { static: false }) logScrollEl!: ElementRef;
+  @ViewChild('paletteScroll', { static: false }) paletteScrollEl!: ElementRef;
+  @ViewChild('vnPaletteBrowser') vnPaletteBrowser: PaletteBrowserComponent;
 
   actors: VnActor[] = [];
   selectedCharacterId: string = '';
@@ -370,7 +374,7 @@ export class VnStageComponent implements OnInit, OnDestroy {
         if (actor.text === obj.text && Date.now() - actor.lastSpokeAt < 3000) return;
         this.ngZone.run(() => this.applyChatMessage(obj));
       });
-    console.log('[VN] Event handlers registered after sync grace period');
+    Logger.debug('[VN] Event handlers registered after sync grace period');
 
     // Request VN_STAGE_FULL from all existing peers (handles late VN activation)
     const peers = Network.peerContexts.filter(p => p.peerId !== Network.peerContext?.peerId);
@@ -852,6 +856,11 @@ export class VnStageComponent implements OnInit, OnDestroy {
 
   sectionTitle(line: string): string {
     return line.replace(/^\/\/---+/, '').replace(/-+$/, '').replace(/^◆/, '');
+  }
+
+  get selectedChatPalette() {
+    const character = ObjectStore.instance.get<GameCharacter>(this.selectedCharacterId);
+    return character instanceof GameCharacter ? character.chatPalette : null;
   }
 
   get selectedPaletteLines(): string[] {
@@ -1746,22 +1755,7 @@ export class VnStageComponent implements OnInit, OnDestroy {
   }
 
   jumpToIndex(idx: { name: string; line: number }) {
-    this.paletteSearchText = '';
-    this.scrollToIndex = idx.line;
-    this.refreshPaletteFade();
-    this.refreshIndexFade();
-    setTimeout(() => {
-      try {
-        const el = document.querySelector('.vn-palette-scroll');
-        if (!el) return;
-        // DOM childrenは空行含む全行に対応する要素を持つ
-        // paletteIndex.line == visiblePaletteLinesのインデックス == DOM childrenのインデックス
-        const children = el.children;
-        if (children[idx.line]) {
-          (children[idx.line] as HTMLElement).scrollIntoView({ block: 'center' });
-        }
-      } catch (e) { console.warn('jumpToIndex error', e); }
-    }, 200);
+    this.vnPaletteBrowser?.jumpToLine(idx.line);
   }
 
   selectPaletteLine(line: string) {
@@ -1786,6 +1780,7 @@ export class VnStageComponent implements OnInit, OnDestroy {
   }
 
   sendPaletteLine(line: string) {
+    if (!isPaletteCommand(line)) return;
     const character = ObjectStore.instance.get<GameCharacter>(this.selectedCharacterId);
     if (!(character instanceof GameCharacter)) return;
     const palette = character.chatPalette;
@@ -2059,14 +2054,14 @@ export class VnStageComponent implements OnInit, OnDestroy {
     const cached = ImageStorage.instance.get(identifier);
     if (cached && cached.url) return;
     this.loadingImages.add(identifier);
-    ServerMediaStorage.fetchImage(identifier)
+    ServerMediaStorage.fetchImageOrNull(identifier)
       .then(image => {
         if (image) {
           ImageStorage.instance.add(image);
           this.ngZone.run(() => { this.now = Date.now(); });
         }
       })
-      .catch(err => console.warn('VN image fetch fail', identifier, err))
+      .catch(err => Logger.warn('VN image fetch fail', identifier, err))
       .finally(() => this.loadingImages.delete(identifier));
   }
 

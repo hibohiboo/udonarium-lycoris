@@ -4,9 +4,11 @@ import { setZeroTimeout } from '../util/zero-timeout';
 import { EventSystem } from '..';
 import { ObjectContext } from '../../synchronize-object/game-object';
 import { ObjectStore } from '../../synchronize-object/object-store';
+import { reconcileChatTabsFromSnapshot } from '../../synchronize-object/room-snapshot-reconciler';
 import { Connection, ConnectionCallback } from './connection';
 import { PeerContext } from './peer-context';
 import { PeerSessionGrade } from './peer-session-state';
+import { Logger } from '../util/logger';
 
 interface RelayDataContainer {
   data: Uint8Array;
@@ -61,6 +63,7 @@ export class WebSocketRelayConnection implements Connection {
   private snapshotSaveDueAt = 0;
   private snapshotDirtyAt = 0;
   private forceSnapshotApply = false;
+  private bundleDownloaded = false;
   open(peerId: string)
   open(userId: string, roomId: string, roomName: string, password: string)
   open(...args: any[]) {
@@ -141,14 +144,15 @@ export class WebSocketRelayConnection implements Connection {
     });
   }
 
-  forceResync() {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.peerContext.isRoom) return;
+  forceResync(): boolean {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.peerContext.isRoom) return false;
     this.forceSnapshotApply = true;
     this.sendSignal({ type: 'resync-request' });
     setTimeout(() => {
       if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.peerContext.isRoom) return;
       this.sendSignal({ type: 'sync-request', sinceSeq: 0 });
     }, 2000);
+    return true;
   }
 
   private openSocket() {
@@ -207,20 +211,20 @@ export class WebSocketRelayConnection implements Connection {
         this.lastSeq = Math.max(this.lastSeq, message.snapshotSeq || message.seq || 0);
         break;
       case 'snapshot-rejected':
-        console.warn(`snapshot rejected: ${message.reason || 'unknown'} objects=${message.objects || 0} previous=${message.previousObjects || 0}`);
+        Logger.warn(`snapshot rejected: ${message.reason || 'unknown'} objects=${message.objects || 0} previous=${message.previousObjects || 0}`);
         this.lastSeq = Math.min(this.lastSeq, message.snapshotSeq || message.seq || this.lastSeq);
         this.forceSnapshotApply = true;
         this.sendSignal({ type: 'sync-request', sinceSeq: 0 });
         break;
       case 'snapshot-save-request':
-        console.log(`server requested snapshot save, seq=${message.seq}`);
+        Logger.debug(`server requested snapshot save, seq=${message.seq}`);
         this.scheduleSnapshotSave(1000);
         break;
       case 'peers':
         this.setPeers(message.peers.filter(peerId => peerId !== this.peerId && this.isSameRoomPeer(peerId)));
         break;
       case 'room-snapshot':
-        this.receiveSnapshot(message.events || [], message.seq || 0, message.snapshot, message.snapshotSeq || 0);
+        this.receiveSnapshot(message.events || [], message.seq || 0, message.snapshot, message.snapshotSeq || 0, message.roomKey);
         break;
       case 'relay-data':
         this.receiveRelayData(message.from, message.container, message.seq || 0);
@@ -243,8 +247,14 @@ export class WebSocketRelayConnection implements Connection {
     }
   }
 
-  private receiveSnapshot(events: StoredRelayEvent[], serverSeq: number, snapshot?: RoomSnapshot, snapshotSeq: number = 0) {
+  private async receiveSnapshot(events: StoredRelayEvent[], serverSeq: number, snapshot?: RoomSnapshot, snapshotSeq: number = 0, roomKey?: string) {
     this.inboundQueue = this.inboundQueue.then(async () => {
+      // 入室時の初回スナップショットの場合、メディアを一括ダウンロードしてから適用する
+      Logger.info(`[bundle-check] snapshot=${!!snapshot} hasData=${!!(snapshot && snapshot.data)} hasObjects=${!!(snapshot && snapshot.data && snapshot.data.objects)} roomKey=${roomKey} bundleDownloaded=${this.bundleDownloaded}`);
+      if (snapshot && snapshot.data && snapshot.data.objects && roomKey && !this.bundleDownloaded) {
+        this.bundleDownloaded = true;
+        await this.downloadMediaBundle(snapshot.data.objects, roomKey);
+      }
       if (snapshot && snapshot.data && snapshot.data.objects && (snapshotSeq > this.lastSeq || this.forceSnapshotApply)) {
         await this.applyObjectSnapshot(snapshot.data.objects, snapshot.from || 'server-snapshot');
         this.forceSnapshotApply = false;
@@ -265,18 +275,163 @@ export class WebSocketRelayConnection implements Connection {
     return { objects: ObjectStore.instance.getObjects().map(object => object.toContext()) };
   }
 
-  private async applyObjectSnapshot(objects: ObjectContext[], sendFrom: string) {
-    const batchSize = 100;
-    let applied = 0;
-    for (let context of objects) {
-      if (!context || !context.identifier || ObjectStore.instance.isDeleted(context.identifier)) continue;
-      EventSystem.trigger({ eventName: 'UPDATE_GAME_OBJECT', data: context, sendFrom });
-      applied++;
-      // Large rooms can have 2000+ objects. Yield between batches so the browser
-      // can paint/process input and avoid appearing frozen during snapshot apply.
-      if (applied % batchSize === 0) {
-        await new Promise<void>(resolve => setTimeout(resolve, 0));
+  /**
+   * 入室時にルームの全メディアをZIPで一括ダウンロードする。
+   * サーバーの /api/room/:roomKey/bundle から全画像・音声を1つのZIPで受け取り、
+   * 展開して ImageStorage / AudioStorage に登録する。
+   */
+  private async downloadMediaBundle(objects: ObjectContext[], roomKey: string): Promise<void> {
+    const operationId = `relay-room-media-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    let total = 0;
+    try {
+      const resp = await fetch(`/api/room/${encodeURIComponent(roomKey)}/bundle`, { method: 'HEAD' });
+      const len = parseInt(resp.headers.get('content-length') || '0', 10);
+      // HEADで存在確認（0件の場合はmanifest JSONが返る）
+      if (!resp.ok) return;
+    } catch (e) {
+      Logger.warn('[bundle] HEAD check failed, skipping', e);
+      return;
+    }
+
+    Logger.info('[bundle] downloading media bundle ZIP...');
+    EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'downloading', total: 0, done: 0 });
+
+    try {
+      const { ServerMediaStorage } = await import('../../file-storage/server-media-storage');
+      const { ImageStorage } = await import('../../file-storage/image-storage');
+      const { AudioStorage } = await import('../../file-storage/audio-storage');
+      const JSZip = (await import('jszip')).default;
+
+      const resp = await fetch(`/api/room/${encodeURIComponent(roomKey)}/bundle`);
+      if (!resp.ok) {
+        Logger.warn('[bundle] fetch failed', resp.status);
+        EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'done', total: 0, done: 0 });
+        return;
       }
+
+      const arrayBuffer = await resp.arrayBuffer();
+      EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'extracting', total: 0, done: 0 });
+      const zip = await JSZip.loadAsync(arrayBuffer);
+
+      // manifestから件数取得
+      const manifestFile = zip.file('_manifest.json');
+      let manifest: Array<{ kind: string; hash: string; name: string; type: string }> = [];
+      if (manifestFile) {
+        manifest = JSON.parse(await manifestFile.async('text'));
+      }
+      total = manifest.length;
+      if (total === 0) {
+        EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'done', total: 0, done: 0 });
+        return;
+      }
+
+      Logger.info(`[bundle] ZIP contains ${total} media files, extracting...`);
+
+      let done = 0;
+      EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'extracting', total, done });
+      // ファイルを順次展開してStorageに登録
+      for (const entry of manifest) {
+        const zipEntry = zip.file(`${entry.kind}/${entry.hash}`);
+        if (!zipEntry) {
+          done++;
+          EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'extracting', total, done });
+          continue;
+        }
+
+        try {
+          const blob = await zipEntry.async('blob');
+          if (entry.kind === 'image') {
+            const file = entry.name && entry.name !== entry.hash
+              ? await (await import('../../file-storage/image-file')).ImageFile.createAsync(blob, entry.name)
+              : await (await import('../../file-storage/image-file')).ImageFile.createAsync(blob);
+            ImageStorage.instance.add(file);
+          } else if (entry.kind === 'audio') {
+            const file = entry.name && entry.name !== entry.hash
+              ? await (await import('../../file-storage/audio-file')).AudioFile.createAsync(blob, entry.name)
+              : await (await import('../../file-storage/audio-file')).AudioFile.createAsync(blob);
+            AudioStorage.instance.add(file);
+          }
+        } catch (e) {
+          Logger.warn(`[bundle] failed to extract ${entry.kind}/${entry.hash}`, e);
+        }
+
+        done++;
+        EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'extracting', total, done });
+      }
+
+      // サーバーに存在をマーク（個別fetchをスキップさせる）
+      for (const entry of manifest) {
+        (ServerMediaStorage as any).knownOnServer?.add?.(entry.hash);
+      }
+
+      EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'done', total, done });
+      Logger.info(`[bundle] extraction complete: ${done}/${total}`);
+    } catch (e) {
+      Logger.warn('[bundle] download failed', e);
+      EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'done', total, done: 0 });
+    }
+  }
+
+  private async applyObjectSnapshot(objects: ObjectContext[], sendFrom: string) {
+    const syncId = `relay-snapshot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    // Prioritize chat logs and core table objects so players see conversation
+    // history and the game board first when joining a large room.
+    const priorityOrder: Record<string, number> = {
+      'chat-tab-list': 0,
+      'chat-tab': 1,
+      'chat': 2,
+      'game-table': 3,
+      'PeerCursor': 4,
+      'character': 5,
+      'character-group': 6,
+    };
+    const sorted = objects.slice().sort((a, b) => {
+      const pa = priorityOrder[a.aliasName] ?? 99;
+      const pb = priorityOrder[b.aliasName] ?? 99;
+      return pa - pb;
+    });
+
+    const batchSize = 100;
+    let processed = 0;
+    EventSystem.trigger('INITIAL_ROOM_SYNC_PROGRESS', {
+      syncId,
+      phase: 'applying',
+      total: sorted.length,
+      done: 0
+    });
+    try {
+      for (let context of sorted) {
+        processed++;
+        if (context && context.identifier && !ObjectStore.instance.isDeleted(context.identifier)) {
+          EventSystem.trigger({ eventName: 'UPDATE_GAME_OBJECT', data: context, sendFrom });
+        }
+        // Large rooms can have 2000+ objects. Yield between batches so the browser
+        // can paint/process input and avoid appearing frozen during snapshot apply.
+        if (processed % batchSize === 0) {
+          EventSystem.trigger('INITIAL_ROOM_SYNC_PROGRESS', {
+            syncId,
+            phase: 'applying',
+            total: sorted.length,
+            done: processed
+          });
+          await new Promise<void>(resolve => setTimeout(resolve, 0));
+        }
+      }
+      reconcileChatTabsFromSnapshot(sorted);
+      EventSystem.trigger('INITIAL_ROOM_SYNC_PROGRESS', {
+        syncId,
+        phase: 'complete',
+        total: sorted.length,
+        done: processed
+      });
+    } catch (error) {
+      EventSystem.trigger('INITIAL_ROOM_SYNC_PROGRESS', {
+        syncId,
+        phase: 'failed',
+        total: sorted.length,
+        done: processed
+      });
+      throw error;
     }
   }
 
@@ -307,13 +462,20 @@ export class WebSocketRelayConnection implements Connection {
     this.snapshotSaveTimer = setTimeout(() => this.saveSnapshot(), Math.max(0, dueAt - now));
   }
 
+  /** 手動スナップショット保存（UIボタンから呼び出し可能） */
+  manualSaveSnapshot(): boolean {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.peerContext.isRoom) return false;
+    this.saveSnapshot();
+    return true;
+  }
+
   private saveSnapshot() {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.peerContext.isRoom) return;
     this.snapshotSaveTimer = null;
     this.snapshotSaveDueAt = 0;
     this.snapshotDirtyAt = 0;
     let snapshot = this.createObjectSnapshot();
-    console.log(`save snapshot request objects=${snapshot.objects.length}`);
+    Logger.debug(`save snapshot request objects=${snapshot.objects.length}`);
     this.sendSignal({ type: 'snapshot-save', snapshot });
   }
 

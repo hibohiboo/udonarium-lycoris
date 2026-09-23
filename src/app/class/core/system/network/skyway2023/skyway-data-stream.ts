@@ -2,12 +2,13 @@ import { LocalDataStream, P2PConnection, Publication, RemoteDataStream, RemoteMe
 import { EventEmitter } from 'events';
 import { MessagePack } from '../../util/message-pack';
 import { UUID } from '../../util/uuid';
-import { setZeroTimeout } from '../../util/zero-timeout';
+import { clearZeroTimeout, setZeroTimeout } from '../../util/zero-timeout';
 import { IPeerContext, PeerContext } from '../peer-context';
 import { PeerSessionGrade } from '../peer-session-state';
 import { CandidateType, WebRTCStats } from '../webrtc/webrtc-stats';
 import { WebRTCConnection, WebRTCStatsMonitor } from '../webrtc/webrtc-stats-monitor';
 import { SkyWayFacade } from './skyway-facade';
+import { Logger } from '../../util/logger';
 
 interface Ping {
   from: string;
@@ -34,12 +35,31 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
   private chunkSize = 15.5 * 1024;
   private receivedMap: Map<string, ReceivedChank> = new Map();
 
-  private stats: WebRTCStats;
+  private stats!: WebRTCStats;
+
+  /**
+   * データ受信タイムアウト監視。
+   * 一定時間データ受信がない場合、接続が死んでいると判断してcloseを発火する。
+   * 旧SkyWay版(skyway-data-connection.ts)の15秒タイムアウトの復元。
+   */
+  private static readonly DATA_TIMEOUT_MS = 15000;
+  private timeoutTimer: ReturnType<typeof setTimeout> | null = null;
 
   get open(): boolean { return this.peer.isOpen; }
-  get member(): RemoteMember { return this.skyWay.room?.members.find(member => member.name === this.peer.peerId); }
+  get member(): RemoteMember { return this.skyWay.room?.members.find(member => member.name === this.peer.peerId) as RemoteMember; }
 
   private isQueuing = false;
+  private static readonly BUFFER_HIGH = 256 * 1024;
+  private static readonly BUFFER_LOW = 64 * 1024;
+  private static readonly SEND_BURST = 64 * 1024;
+  private sendTask: number | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private sendFailures = 0;
+  private onbufferedamountlow = () => {
+    if (this.retryTimer != null) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.scheduleSend();
+  };
   private sendQueue: Set<Uint8Array> = new Set();
 
   private _timestamp: number = performance.now();
@@ -61,20 +81,40 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
   private isOpend = false;
 
   private state: TransportConnectionState = 'new';
-  private subscription: Subscription<RemoteDataStream>;
-  private dataChannel: RTCDataChannel;
+  private subscription!: Subscription<RemoteDataStream>;
+  private dataChannel!: RTCDataChannel;
 
-  private onStreamAdded: { removeListener: () => void };
-  private onStreamPublished: { removeListener: () => void };
-  private onConnectionStateChanged: { removeListener: () => void };
+  private onStreamAdded!: { removeListener: () => void };
+  private onStreamPublished!: { removeListener: () => void };
+  private onConnectionStateChanged!: { removeListener: () => void };
 
   private onopen = () => {
-    console.log(`peer ${this.peer.peerId} dataChannel is open`);
+    Logger.debug(`peer ${this.peer.peerId} dataChannel is open`);
     this.refresh();
   }
 
+  private onclose = () => { this.emit('close'); };
+
   private onmessage = (event: MessageEvent<any>) => {
     this.onData(event.data as ArrayBuffer);
+  }
+
+  /** データ受信タイムアウトタイマーを開始/リセット */
+  private resetTimeoutTimer() {
+    this.clearTimeoutTimer();
+    this.timeoutTimer = setTimeout(() => {
+      Logger.warn(`data timeout ${this.peer.peerId} (${SkyWayDataStream.DATA_TIMEOUT_MS}ms without receiving data)`);
+      this.timeoutTimer = null;
+      // タイムアウト発生 → 強制切断通知
+      this.emit('close');
+    }, SkyWayDataStream.DATA_TIMEOUT_MS);
+  }
+
+  /** データ受信タイムアウトタイマーをクリア */
+  private clearTimeoutTimer() {
+    if (this.timeoutTimer == null) return;
+    clearTimeout(this.timeoutTimer);
+    this.timeoutTimer = null;
   }
 
   private constructor(readonly skyWay: SkyWayFacade, peer: IPeerContext) {
@@ -100,7 +140,7 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
   }
 
   connect() {
-    console.log(`connect ${this.peer.peerId}, isPublication: ${this.isPublication}`);
+    Logger.debug(`connect ${this.peer.peerId}, isPublication: ${this.isPublication}`);
     if (this.isPublication) {
       return this.initializePublication();
     } else {
@@ -109,24 +149,21 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
   }
 
   disconnect() {
-    console.log(`disconnect ${this.peer.peerId}, isPublication: ${this.isPublication}`);
+    Logger.debug(`disconnect ${this.peer.peerId}, isPublication: ${this.isPublication}`);
     this.isCanceled = true;
-    if (this.isOpend) {
-      this.dispose();
-    } else {
-      this.refresh();
-    }
+    this.dispose();
   }
 
   reject() {
-    console.log(`reject ${this.peer.peerId}, isPublication: ${this.isPublication}`);
+    Logger.debug(`reject ${this.peer.peerId}, isPublication: ${this.isPublication}`);
     this.isRejected = true;
     this.connect();
   }
 
   private dispose() {
-    console.log(`dispose ${this.peer.peerId}, isPublication: ${this.isPublication}`);
+    Logger.debug(`dispose ${this.peer.peerId}, isPublication: ${this.isPublication}`);
     this.peer.isOpen = false;
+    this.clearTimeoutTimer();
     this.stopMonitoring();
     this.removeAllListeners();
 
@@ -137,15 +174,29 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
     this.onStreamPublished = null;
     this.onConnectionStateChanged = null;
 
-    this.subscription = null
+    const subscription = this.subscription;
+    this.subscription = null;
+    if (!this.isPublication && subscription && this.skyWay.roomPerson?.state !== 'left') {
+      this.skyWay.roomPerson?.unsubscribe(subscription.id).catch(error => Logger.warn('unsubscribe failed', error));
+    }
+    if (this.sendTask != null) clearZeroTimeout(this.sendTask);
+    if (this.retryTimer != null) clearTimeout(this.retryTimer);
+    this.sendTask = null;
+    this.retryTimer = null;
+    this.isQueuing = false;
+    this.sendQueue.clear();
+    this.receivedMap.clear();
 
     this.dataChannel?.removeEventListener('open', this.onopen);
     this.dataChannel?.removeEventListener('message', this.onmessage);
+    this.dataChannel?.removeEventListener('close', this.onclose);
+    this.dataChannel?.removeEventListener('bufferedamountlow', this.onbufferedamountlow);
     this.dataChannel?.close();
     this.dataChannel = null;
   }
 
   private initializePublication() {
+    if (this.isCanceled) return;
     //
     let member = this.member;
     let subscription = member?.subscriptions.find(subscription => subscription.publication.contentType === 'data'
@@ -154,7 +205,9 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
 
     //
     if (!subscription) {
-      console.error(`subscription is not found ${this.peer.peerId}`);
+      Logger.error(`subscription is not found ${this.peer.peerId}`);
+      this.emit('close');
+      return;
     }
 
     //
@@ -165,14 +218,16 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
     });
 
     //
-    console.log(`initializePublication ${member.name} ${subscription.id}`);
+    Logger.debug(`initializePublication ${member.name} ${subscription.id}`);
     this.subscription = subscription;
     this.refresh();
   }
 
   private async initializeSubscription() {
+    if (this.isCanceled) return;
     //
     let member = this.member;
+    if (!member) { this.emit('close'); return; }
     let publication = member.publications.find(publication => publication.contentType === 'data' && publication.metadata === 'udonarium-data-stream');
 
     //
@@ -182,7 +237,7 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
         let isMatch = event.publication.contentType === 'data' && event.publication.metadata === 'udonarium-data-stream' && event.publication.publisher.name === this.peer.peerId;
         if (!isMatch) return;
 
-        console.log(`onStreamPublished: ${event.publication.publisher.name} <${event.publication.metadata}>`);
+        Logger.debug(`onStreamPublished: ${event.publication.publisher.name} <${event.publication.metadata}>`);
         this.onStreamPublished?.removeListener();
         this.initializeSubscription();
       });
@@ -191,10 +246,14 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
 
     //
     this.refresh();
-    console.log(`initializeSubscription ready ${member.name}`);
+    Logger.debug(`initializeSubscription ready ${member.name}`);
     try {
       let { subscription, stream } = await this.skyWay.roomPerson.subscribe<RemoteDataStream>(publication.id);
 
+      if (this.isCanceled) {
+        await this.skyWay.roomPerson.unsubscribe(subscription.id);
+        return;
+      }
       //
       this.onConnectionStateChanged?.removeListener();
       this.onConnectionStateChanged = subscription.onConnectionStateChanged.add(state => {
@@ -202,25 +261,24 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
       });
 
       //
-      console.log(`initializeSubscription done ${member.name} ${publication.id}`);
+      Logger.debug(`initializeSubscription done ${member.name} ${publication.id}`);
       this.subscription = subscription;
 
       this.refresh();
     } catch (e) {
       if (e instanceof Error) {
-        console.log(`${e.name}: ${e.message}`);
+        Logger.debug(`${e.name}: ${e.message}`);
       } else {
-        console.error(e);
+        Logger.error(e);
       }
 
-      this.subscription = null;
       this.state = 'disconnected';
       this.emit('close');
     }
   }
 
   private onStateChanged(state: TransportConnectionState) {
-    console.log(`onStateChanged isPublication: ${this.isPublication}, ${this.peer.peerId} ${this.state} -> ${state}`);
+    Logger.debug(`onStateChanged isPublication: ${this.isPublication}, ${this.peer.peerId} ${this.state} -> ${state}`);
     switch (state) {
       case 'new': break;
       case 'connecting': break;
@@ -229,7 +287,6 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
         break;
       case 'reconnecting': break;
       case 'disconnected':
-        this.subscription = null;
         this.emit('close');
         return;
     }
@@ -238,6 +295,7 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
   }
 
   private refresh() {
+    if (this.isCanceled) return;
     // 現在のオブジェクトを取得
     let member = this.member;
 
@@ -250,7 +308,7 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
 
     // 接続状況確認
     let isOpen = dataChannel?.readyState === 'open';
-    console.log(`refresh ${member?.name}, isPublication: ${this.isPublication}, isOpen: ${isOpen}, dataChannel: ${dataChannel?.readyState}`);
+    Logger.debug(`refresh ${member?.name}, isPublication: ${this.isPublication}, isOpen: ${isOpen}, dataChannel: ${dataChannel?.readyState}`);
 
     // cancelまたはrejectされているときは接続解除
     if (dataChannel && (this.isCanceled && isOpen || this.isRejected)) {
@@ -263,25 +321,30 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
 
     // RTCDataChannelを更新
     if (dataChannel && this.dataChannel && dataChannel !== this.dataChannel) {
-      console.warn(`dataChannel is change: ${this.dataChannel?.id} -> ${dataChannel.id}`);
+      Logger.warn(`dataChannel is change: ${this.dataChannel?.id} -> ${dataChannel.id}`);
       this.peer.isOpen = false;
     }
 
     this.dataChannel?.removeEventListener('open', this.onopen);
     this.dataChannel?.removeEventListener('message', this.onmessage);
+    this.dataChannel?.removeEventListener('close', this.onclose);
+    this.dataChannel?.removeEventListener('bufferedamountlow', this.onbufferedamountlow);
 
     if (dataChannel) dataChannel.binaryType = 'arraybuffer';
     dataChannel?.addEventListener('open', this.onopen);
     dataChannel?.addEventListener('message', this.onmessage);
+    dataChannel?.addEventListener('close', this.onclose);
+    dataChannel?.addEventListener('bufferedamountlow', this.onbufferedamountlow);
+    if (dataChannel) dataChannel.bufferedAmountLowThreshold = SkyWayDataStream.BUFFER_LOW;
 
     this.dataChannel = dataChannel;
 
     // P2PConnectionを更新
-    console.log(`p2pconnection: ${p2pconnection?.id}`);
+    Logger.debug(`p2pconnection: ${p2pconnection?.id}`);
     this.onStreamAdded?.removeListener();
     if (p2pconnection && !dataChannel) {
       this.onStreamAdded = p2pconnection?.receiver.onStreamAdded.add(event => {
-        console.log(`receiver.onStreamAdded: ${event.stream.id} ${(event.stream as RemoteDataStream)?._datachannel?.readyState}`);
+        Logger.debug(`receiver.onStreamAdded: ${event.stream.id} ${(event.stream as RemoteDataStream)?._datachannel?.readyState}`);
         this.refresh();
       });
     }
@@ -291,10 +354,12 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
       this.peer.isOpen = isOpen;
       if (isOpen) {
         this.isOpend = true;
+        this.timestamp = performance.now();
         this.state = 'connected';
+        this.resetTimeoutTimer();
         this.emit('open');
       } else {
-        this.subscription = null;
+        this.clearTimeoutTimer();
         this.state = 'disconnected';
         this.emit('close');
       }
@@ -306,7 +371,7 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
 
     if (isOpen) {
       this.startMonitoring();
-      if (!this.isQueuing) this.execQueue();
+      this.scheduleSend();
     } else {
       this.stopMonitoring();
     }
@@ -333,27 +398,47 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
   }
 
   private addSendQueue(data: Uint8Array) {
+    if (this.isCanceled || !data) return;
     this.sendQueue.add(data);
-    if (!this.isQueuing) this.execQueue();
+    this.scheduleSend();
+  }
+
+  private scheduleSend() {
+    if (this.isCanceled || this.sendTask != null || this.retryTimer != null || !this.sendQueue.size) return;
+    this.isQueuing = true;
+    this.sendTask = setZeroTimeout(this.execQueue);
   }
 
   private execQueue = () => {
-    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-      if (this.sendQueue.size) console.warn(`peer Connection not open; queueing; ${this.dataChannel?.readyState} -> ${this.member.name} `);
-      this.isQueuing = false;
-      return;
-    }
-    for (let data of this.sendQueue) {
+    this.sendTask = null;
+    this.isQueuing = false;
+    if (this.isCanceled || this.dataChannel?.readyState !== 'open') return;
+    let sent = 0;
+    for (const data of this.sendQueue) {
+      // Wait for bufferedamountlow instead of flooding the browser's SCTP queue.
+      if (this.dataChannel.bufferedAmount + data.byteLength > SkyWayDataStream.BUFFER_HIGH) return;
       try {
         this.dataChannel.send(data);
         this.sendQueue.delete(data);
-      } catch (err) {
-        console.error(err);
+        this.sendFailures = 0;
+        sent += data.byteLength;
+      } catch (error) {
+        // OperationError may be temporary browser buffer pressure. Retry at a
+        // bounded rate, never in a zero-timeout CPU/logging loop.
+        if (error?.name === 'OperationError' && ++this.sendFailures <= 5) {
+          this.retryTimer = setTimeout(() => {
+            this.retryTimer = null;
+            this.scheduleSend();
+          }, 100);
+        } else {
+          Logger.warn('Data channel send failed; reconnecting', error);
+          this.emit('close');
+        }
+        return;
       }
-      break;
+      if (sent >= SkyWayDataStream.SEND_BURST) break;
     }
-    this.isQueuing = 0 < this.sendQueue.size;
-    if (this.isQueuing) setZeroTimeout(this.execQueue);
+    this.scheduleSend();
   }
 
   getPeerConnection(): RTCPeerConnection {
@@ -374,8 +459,8 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
 
   async updateStatsAsync() {
     if (this.stats == null) return;
-    this.sendPing();
     await this.stats.updateAsync();
+    if (this.isCanceled) return;
     this.candidateType = this.stats.candidateType;
 
     let deltaTime = performance.now() - this.timestamp;
@@ -425,6 +510,7 @@ export class SkyWayDataStream extends EventEmitter implements WebRTCConnection {
 
   private onData(data: ArrayBuffer) {
     this.timestamp = performance.now();
+    this.resetTimeoutTimer();
     let decoded: unknown = MessagePack.decode(new Uint8Array(data));
 
     let ping: Ping = decoded as Ping;

@@ -2,6 +2,7 @@ import { ChatTab } from './chat-tab';
 import { SyncObject, SyncVar } from './core/synchronize-object/decorator';
 import { ObjectNode } from './core/synchronize-object/object-node';
 import { InnerXml } from './core/synchronize-object/object-serializer';
+import { Logger } from './core/system/util/logger';
 
 import { PeerCursor } from '@udonarium/peer-cursor';
 import { Network } from '@udonarium/core/system';
@@ -13,17 +14,17 @@ import { ReloadCheck } from '@udonarium/reload-check';
 @SyncObject('chat-tab-list')
 export class ChatTabList extends ObjectNode implements InnerXml {
 
-//  @SyncVar() _systemMessageTabIdentifier: string = null;
+  @SyncVar() _systemMessageTabIdentifier: string = '';
   @SyncVar() _systemMessageTabIndex: number = 0;
-/*
+
   set systemMessageTabIdentifier(tabIdentifier: string){
-    this._systemMessageTabIdentifier = tabIdentifier;
+    this._systemMessageTabIdentifier = tabIdentifier || '';
   }
   
   get systemMessageTabIdentifier(): string{
     return this._systemMessageTabIdentifier;
   }
-*/
+
   set systemMessageTabIndex(index: number){
     this._systemMessageTabIndex = index;
   }
@@ -33,7 +34,18 @@ export class ChatTabList extends ObjectNode implements InnerXml {
   }
 
   get systemMessageTab(): ChatTab{
+    if (this.systemMessageTabIdentifier) {
+      const tab = this.chatTabs.find(chatTab => chatTab.identifier === this.systemMessageTabIdentifier);
+      if (tab) return tab;
+    }
     return this.chatTabs.length > this.systemMessageTabIndex ? this.chatTabs[this.systemMessageTabIndex] : null;
+  }
+
+  setSystemMessageTab(chatTab: ChatTab | null): void {
+    const index = chatTab ? this.chatTabs.indexOf(chatTab) : -1;
+    const fallbackIndex = 0 <= index ? index : 0;
+    this.systemMessageTabIdentifier = chatTab ? chatTab.identifier : '';
+    this.systemMessageTabIndex = fallbackIndex;
   }
 
   get reloadCheck(): ReloadCheck { return ObjectStore.instance.get<ReloadCheck>('ReloadCheck'); }
@@ -132,7 +144,7 @@ export class ChatTabList extends ObjectNode implements InnerXml {
     if( this.chatTabs ){
       let tabNum = this.chatTabs.length;
       let indexList : number[] = [] ;
-      console.log( 'tabNum :' + tabNum );
+      Logger.debug( 'tabNum :' + tabNum );
       for( let i = 0 ; i < tabNum ;i++){
         indexList.push(0);
       }
@@ -163,7 +175,7 @@ export class ChatTabList extends ObjectNode implements InnerXml {
         let myId = Network.peerContext.userId; //1.13.xとのmargeで修正
         if( to ){
           if( ( to != myId) && ( from != myId) ){
-            console.log( " SKIP " + from + " > " + to + " : " + this.chatTabs[ fastTabIndex ].chatMessages[ indexList[fastTabIndex] ].text );
+            Logger.debug( " SKIP " + from + " > " + to + " : " + this.chatTabs[ fastTabIndex ].chatMessages[ indexList[fastTabIndex] ].text );
             indexList[ fastTabIndex ] ++;
             continue;
           }
@@ -203,7 +215,7 @@ export class ChatTabList extends ObjectNode implements InnerXml {
     if( this.chatTabs ){
       let tabNum = this.chatTabs.length;
       let indexList : number[] = [] ;
-      console.log( 'tabNum :' + tabNum );
+      Logger.debug( 'tabNum :' + tabNum );
       for( let i = 0 ; i < tabNum ;i++){
         indexList.push(0);
       }
@@ -234,7 +246,7 @@ export class ChatTabList extends ObjectNode implements InnerXml {
         let myId = Network.peerContext.userId; //1.13.xとのmargeで修正
         if( to ){
           if( ( to != myId) && ( from != myId) ){
-            console.log( " SKIP " + from + " > " + to + " : " + this.chatTabs[ fastTabIndex ].chatMessages[ indexList[fastTabIndex] ].text );
+            Logger.debug( " SKIP " + from + " > " + to + " : " + this.chatTabs[ fastTabIndex ].chatMessages[ indexList[fastTabIndex] ].text );
             indexList[ fastTabIndex ] ++;
             continue;
           }

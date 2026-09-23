@@ -1,3 +1,4 @@
+import { PaletteBrowserComponent } from 'component/palette-browser/palette-browser.component';
 import { CommonModule } from '@angular/common';
 import { NgModule } from '@angular/core';
 import { FormsModule } from '@angular/forms';
@@ -29,6 +30,9 @@ import { FileStorageComponent } from 'component/file-storage/file-storage.compon
 import { GameCharacterGeneratorComponent } from 'component/game-character-generator/game-character-generator.component';
 import { GameCharacterSheetComponent } from 'component/game-character-sheet/game-character-sheet.component';
 import { GameCharacterComponent } from 'component/game-character/game-character.component';
+import { CharacterGroupComponent } from 'component/character-group/character-group.component';
+import { CharacterGroupPartsPanelComponent } from 'component/character-group-parts/character-group-parts.component';
+import { GameCharacterGroup } from '@udonarium/game-character-group';
 import { GameDataElementComponent } from 'component/game-data-element/game-data-element.component';
 
 import { GameDataElementBuffComponent } from 'component/game-data-element-buff/game-data-element-buff.component';
@@ -42,6 +46,7 @@ import { LobbyComponent } from 'component/lobby/lobby.component';
 import { LinkyModule } from 'ngx-linky';
 import { ModalComponent } from 'component/modal/modal.component';
 import { NetworkIndicatorComponent } from 'component/network-indicator/network-indicator.component';
+import { ServerStatusComponent } from 'component/server-status/server-status.component';
 import { NgSelectModule } from '@ng-select/ng-select';
 import { OverviewPanelComponent } from 'component/overview-panel/overview-panel.component';
 import { PasswordCheckComponent } from 'component/password-check/password-check.component';
@@ -84,6 +89,7 @@ import { VnStageComponent } from 'component/vn-stage/vn-stage.component';
 import { LightingLayerComponent } from 'component/lighting-layer/lighting-layer.component';
 import { LightingPanelComponent } from 'component/lighting-panel/lighting-panel.component';
 import { DiceCutinComponent } from 'component/dice-cutin/dice-cutin.component';
+import { ContestedRollCutinComponent } from 'component/contested-roll-cutin/contested-roll-cutin.component';
 import { OptionsPanelComponent } from 'component/options-panel/options-panel.component';
 import { InitiativeTrackerComponent } from 'component/initiative-tracker/initiative-tracker.component';
 import { InitiativePanelComponent } from 'component/initiative-panel/initiative-panel.component';
@@ -142,6 +148,8 @@ import { AppComponent } from './app.component';
     GameCharacterGeneratorComponent,
     GameCharacterSheetComponent,
     GameCharacterComponent,
+    CharacterGroupComponent,
+    CharacterGroupPartsPanelComponent,
     GameDataElementComponent,
 
     GameDataElementBuffComponent,
@@ -162,9 +170,11 @@ import { AppComponent } from './app.component';
     VoteMenuComponent,
     VoteWindowComponent,
     VnStageComponent,
+    PaletteBrowserComponent,
     LightingLayerComponent,
     LightingPanelComponent,
     DiceCutinComponent,
+    ContestedRollCutinComponent,
     OptionsPanelComponent,
     InitiativeTrackerComponent,
     InitiativePanelComponent,
@@ -201,6 +211,7 @@ import { AppComponent } from './app.component';
     MovableDirective,
     RotableDirective,
     NetworkIndicatorComponent,
+    ServerStatusComponent,
     DiceSymbolComponent,
     TooltipDirective,
     DraggableDirective,

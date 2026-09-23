@@ -5,7 +5,9 @@ import { FileReaderUtil } from './file-reader-util';
 import { ImageContext, ImageFile, ImageState } from './image-file';
 import { CatalogItem, ImageStorage } from './image-storage';
 import { MimeType } from './mime-type';
+import { MediaLoadPriority } from './media-load-priority';
 import { ServerMediaStorage } from './server-media-storage';
+import { Logger } from '../system/util/logger';
 
 export class ImageSharingSystem {
   private static _instance: ImageSharingSystem
@@ -16,42 +18,93 @@ export class ImageSharingSystem {
 
   private sendTaskMap: Map<string, BufferSharingTask<ImageContext[]>> = new Map();
   private receiveTaskMap: Map<string, BufferSharingTask<ImageContext[]>> = new Map();
-  private maxSendTask: number = 2;
-  private maxReceiveTask: number = 4;
+  private maxSendTask: number = 6;
+  private maxReceiveTask: number = 12;
 
   private constructor() {
-    console.log('FileSharingSystem ready...');
+    Logger.debug('FileSharingSystem ready...');
   }
 
   initialize() {
     EventSystem.register(this)
       .on('CONNECT_PEER', 1, event => {
         if (!event.isSendFromSelf) return;
-        console.log('CONNECT_PEER ImageStorageService !!!', event.data.peerId);
-        ImageStorage.instance.synchronize();
+        Logger.debug('CONNECT_PEER ImageStorageService !!!', event.data.peerId);
+        // InitialRoomSync sends one room ZIP first.  Older peers are handled by
+        // the explicit INITIAL_ROOM_SYNC_FALLBACK path below.
+      })
+      .on('INITIAL_ROOM_SYNC_FALLBACK', event => {
+        if (!event.isSendFromSelf || !event.data?.peerId) return;
+        ImageStorage.instance.synchronize(event.data.peerId);
+      })
+      .on('INITIAL_ROOM_MEDIA_CATALOG_FALLBACK', event => {
+        if (!event.isSendFromSelf || !Array.isArray(event.data?.images)) return;
+        this.applyInitialCatalog(event.data.images, event.data.sourcePeerId);
       })
       .on('XML_LOADED', event => {
         convertUrlImage(event.data.xmlElement);
       })
       .on('SYNCHRONIZE_FILE_LIST', async event => {
         if (event.isSendFromSelf) return;
-        console.log('SYNCHRONIZE_FILE_LIST ImageStorageService ' + event.sendFrom);
+        Logger.debug('SYNCHRONIZE_FILE_LIST ImageStorageService ' + event.sendFrom);
 
         let otherCatalog: CatalogItem[] = event.data;
         let request: CatalogItem[] = [];
 
+        // サーバーfetchを並列バッチで実行
+        // FirefoxはHTTP/2接続プール上限が厳しいため並列数を抑える
+        const isFirefox = typeof navigator !== 'undefined' && /firefox/i.test(navigator.userAgent);
+        const BATCH_SIZE = isFirefox ? 6 : 16;
+        const LOW_PRIORITY_BATCH = isFirefox ? 3 : 6;
+        const needFetch: CatalogItem[] = [];
+
+        const hashPattern = /^[a-f0-9]{64}$/i;
         for (let item of otherCatalog) {
-          let image: ImageFile = ImageStorage.instance.get(item.identifier);
+          let image: ImageFile = ImageStorage.instance.get(item.identifier, false);
           if (image === null) {
-            image = ImageFile.createEmpty(item.identifier);
-            ImageStorage.instance.add(image);
+            if (hashPattern.test(item.identifier)) {
+              // SHA-256 hash: create empty placeholder, fetch from server later
+              image = ImageFile.createEmpty(item.identifier);
+              ImageStorage.instance.add(image);
+            } else {
+              // URL-based identifier (e.g. ./assets/images/trump/x02.gif):
+              // add as a URL image so the browser loads it from the app assets
+              image = ImageStorage.instance.add(item.identifier);
+            }
           }
           if (image.state < ImageState.COMPLETE && !this.receiveTaskMap.has(item.identifier)) {
-            let fetched = await ServerMediaStorage.fetchImage(item.identifier);
-            if (fetched) {
-              ImageStorage.instance.add(fetched);
+            needFetch.push(item);
+          }
+        }
+
+        // 見える範囲（卓背景・卓上コマ・VN立ち絵など）を先に、未参照/控え画像を後で取得する
+        const priorityScores = MediaLoadPriority.getImageScoreMap();
+        const prioritizedFetch = MediaLoadPriority.sortByScore(needFetch, priorityScores);
+        for (let i = 0; i < prioritizedFetch.length;) {
+          const score = MediaLoadPriority.scoreOf(priorityScores, prioritizedFetch[i].identifier);
+          const batchSize = score >= MediaLoadPriority.VISIBLE_IMAGE_SCORE ? BATCH_SIZE : LOW_PRIORITY_BATCH;
+          const priority = MediaLoadPriority.fetchPriority(score, MediaLoadPriority.VISIBLE_IMAGE_SCORE);
+          const batch = prioritizedFetch.slice(i, i + batchSize);
+          i += batch.length;
+          const results = await Promise.all(
+            batch.map(async item => {
+              try {
+                const result = await ServerMediaStorage.fetchImage(item.identifier, priority);
+                return { item, result };
+              } catch (e) {
+                return { item, result: { status: 'unreachable' as const } };
+              }
+            })
+          );
+          for (const { item, result } of results) {
+            if (result.status === 'ok') {
+              ImageStorage.instance.add(result.file);
+            } else if (result.status === 'missing') {
+              // サーバーに存在しない画像はplaceholderを削除して永久ぐるぐるを防止
+              ImageStorage.instance.delete(item.identifier);
+              Logger.debug(`[ImageSharingSystem] removed missing placeholder: ${item.identifier}`);
             } else {
-              request.push({ identifier: item.identifier, state: image.state });
+              request.push(item);
             }
           }
         }
@@ -73,7 +126,7 @@ export class ImageSharingSystem {
         let randomRequest: CatalogItem[] = [];
 
         for (let item of request) {
-          let image: ImageFile = ImageStorage.instance.get(item.identifier);
+          let image: ImageFile = ImageStorage.instance.get(item.identifier, false);
           if (image && item.state < image.state)
             randomRequest.push({ identifier: item.identifier, state: item.state });
         }
@@ -81,7 +134,7 @@ export class ImageSharingSystem {
         if (this.isLimitSendTask() === false && 0 < randomRequest.length && !this.existsSendTask(event.data.receiver)) {
           // 送信
           let updateImages: ImageContext[] = this.makeSendUpdateImages(randomRequest);
-          console.log('REQUEST_FILE_RESOURE ImageStorageService Send!!! ' + event.data.receiver + ' -> ' + updateImages.length);
+          Logger.debug('REQUEST_FILE_RESOURE ImageStorageService Send!!! ' + event.data.receiver + ' -> ' + updateImages.length);
           this.startSendTask(updateImages, event.data.receiver);
         } else {
           // 中継
@@ -90,16 +143,16 @@ export class ImageSharingSystem {
           if (-1 < index) candidatePeers.splice(index, 1);
 
           for (let peerId of candidatePeers) {
-            console.log('REQUEST_FILE_RESOURE ImageStorageService Relay!!! ' + peerId + ' -> ' + event.data.identifiers);
+            Logger.debug('REQUEST_FILE_RESOURE ImageStorageService Relay!!! ' + peerId + ' -> ' + event.data.identifiers);
             EventSystem.call(event, peerId);
             return;
           }
-          console.log('REQUEST_FILE_RESOURE ImageStorageService あぶれた...' + event.data.receiver, randomRequest.length);
+          Logger.debug('REQUEST_FILE_RESOURE ImageStorageService あぶれた...' + event.data.receiver, randomRequest.length);
         }
       })
       .on('UPDATE_FILE_RESOURE', 1000, event => {
         let updateImages: ImageContext[] = event.data.updateImages;
-        console.log('UPDATE_FILE_RESOURE ImageStorageService ' + event.sendFrom + ' -> ', updateImages);
+        Logger.debug('UPDATE_FILE_RESOURE ImageStorageService ' + event.sendFrom + ' -> ', updateImages);
         for (let context of updateImages) {
           if (context.blob) context.blob = new Blob([context.blob], { type: context.type });
           if (context.thumbnail.blob) context.thumbnail.blob = new Blob([context.thumbnail.blob], { type: context.thumbnail.type });
@@ -107,16 +160,30 @@ export class ImageSharingSystem {
         }
       })
       .on('START_FILE_TRANSMISSION', event => {
-        console.log('START_FILE_TRANSMISSION ' + event.data.taskIdentifier);
+        Logger.debug('START_FILE_TRANSMISSION ' + event.data.taskIdentifier);
         let identifier = event.data.taskIdentifier;
-        let image: ImageFile = ImageStorage.instance.get(identifier);
+        let image: ImageFile = ImageStorage.instance.get(identifier, false);
         if (this.receiveTaskMap.has(identifier) || (image && ImageState.COMPLETE <= image.state)) {
-          console.warn('CANCEL_TASK_ ' + identifier);
+          Logger.warn('CANCEL_TASK_ ' + identifier);
           EventSystem.call('CANCEL_TASK_' + identifier, null, event.sendFrom);
         } else {
           this.startReceiveTask(identifier);
         }
       });
+  }
+
+  /**
+   * Reuses the normal per-file HTTP/P2P path for a catalog embedded in the
+   * initial room ZIP.  The event is local but carries the selected source peer
+   * so missing server media can still fall back to that peer.
+   */
+  applyInitialCatalog(catalog: CatalogItem[], sourcePeerId: string) {
+    if (!Array.isArray(catalog) || !sourcePeerId) return;
+    EventSystem.trigger({
+      eventName: 'SYNCHRONIZE_FILE_LIST',
+      data: catalog,
+      sendFrom: sourcePeerId
+    });
   }
 
   private destroy() {
@@ -157,7 +224,7 @@ export class ImageSharingSystem {
     }
 
     task.start();
-    console.log('startReceiveTask => ', this.receiveTaskMap.size);
+    Logger.debug('startReceiveTask => ', this.receiveTaskMap.size);
   }
 
   private stopSendTask(identifier: string) {
@@ -165,7 +232,7 @@ export class ImageSharingSystem {
     if (task) { task.cancel(); }
     this.sendTaskMap.delete(identifier);
 
-    console.log('stopSendTask => ', this.sendTaskMap.size);
+    Logger.debug('stopSendTask => ', this.sendTaskMap.size);
   }
 
   private stopReceiveTask(identifier: string) {
@@ -173,11 +240,11 @@ export class ImageSharingSystem {
     if (task) { task.cancel(); }
     this.receiveTaskMap.delete(identifier);
 
-    console.log('stopReceiveTask => ', this.receiveTaskMap.size);
+    Logger.debug('stopReceiveTask => ', this.receiveTaskMap.size);
   }
 
   private request(request: CatalogItem[], peerId: string) {
-    console.log('requestFile() ' + peerId);
+    Logger.debug('requestFile() ' + peerId);
     let peerIds = Network.peerIds;
     peerIds.splice(peerIds.indexOf(Network.peerId), 1);
     EventSystem.call('REQUEST_FILE_RESOURE', { identifiers: request, receiver: Network.peerId, candidatePeers: peerIds }, peerId);
@@ -201,7 +268,7 @@ export class ImageSharingSystem {
 
     for (let i = 0; i < catalog.length; i++) {
       let item: { identifier: string, state: number } = catalog[i];
-      let image: ImageFile = ImageStorage.instance.get(item.identifier);
+      let image: ImageFile = ImageStorage.instance.get(item.identifier, false);
 
       let context: ImageContext = {
         identifier: image.identifier,

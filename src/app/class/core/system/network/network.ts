@@ -1,6 +1,7 @@
 import { setZeroTimeout } from '../util/zero-timeout';
 import { Connection, ConnectionCallback } from './connection';
 import { IPeerContext, PeerContext } from './peer-context';
+import { Logger } from '../util/logger';
 
 type QueueItem = { data: any, sendTo: string };
 type ConnectionClass = new (...args: any[]) => Connection;
@@ -29,9 +30,9 @@ export class Network {
   private signalingUrl: string = '';
   private iceServers: RTCIceServer[] = [];
   private config: any = {};
-  private connectionClassPromise: Promise<ConnectionClass>;
-  private connectionClass: ConnectionClass;
-  private connection: Connection;
+  private connectionClassPromise!: Promise<ConnectionClass>;
+  private connectionClass!: ConnectionClass;
+  private connection!: Connection;
 
   private queue: Set<QueueItem> = new Set();
   private sendInterval: number = null;
@@ -39,7 +40,7 @@ export class Network {
   private callbackUnload: any = (e) => { this.close(); };
 
   private constructor() {
-    console.log('Network ready...');
+    Logger.debug('Network ready...');
   }
 
   configure(config: any) {
@@ -50,7 +51,7 @@ export class Network {
   open(userId: string, roomId: string, roomName: string, password: string)
   open(...args: any[]) {
     if (this.connectionClassPromise || (this.connection && this.connection.peerContext)) {
-      console.warn('It is already opened.');
+      Logger.warn('It is already opened.');
       this.close();
     }
 
@@ -63,7 +64,7 @@ export class Network {
     this.connectionClass = await promise;
     if (this.connectionClassPromise !== promise) return;
 
-    console.log('Network open...', args);
+    Logger.debug('Network open...', args);
     this.connection = this.initializeConnection();
     this.connection.open.apply(this.connection, args);
 
@@ -75,7 +76,7 @@ export class Network {
     this.connection = null;
     this.connectionClassPromise = null;
     window.removeEventListener('unload', this.callbackUnload, false);
-    console.log('Network close...円柱');
+    Logger.debug('Network close...円柱');
  }
 
   private close() {
@@ -83,7 +84,7 @@ export class Network {
     this.connection = null;
     this.connectionClassPromise = null;
     window.removeEventListener('unload', this.callbackUnload, false);
-    console.log('Network close...');
+    Logger.debug('Network close...');
   }
 
   connect(peerId: string): boolean {
@@ -94,7 +95,7 @@ export class Network {
   disconnect(peerId: string) {
     if (!this.connection) return;
     if (this.connection.disconnect(peerId)) {
-      console.log('<disconnectPeer()> Peer:' + peerId);
+      Logger.debug('<disconnectPeer()> Peer:' + peerId);
       this.disconnect(peerId);
     }
   }
@@ -146,12 +147,12 @@ export class Network {
   }
 
   setApiKey(key: string) {
-    if (this.key !== key) console.log('Key Change');
+    if (this.key !== key) Logger.debug('Key Change');
     this.key = key;
   }
 
   setSignalingUrl(url: string) {
-    if (this.signalingUrl !== url) console.log('Signaling URL Change');
+    if (this.signalingUrl !== url) Logger.debug('Signaling URL Change');
     this.signalingUrl = url;
   }
 
@@ -163,8 +164,14 @@ export class Network {
     return this.connection ? this.connection.listAllPeers() : Promise.resolve([]);
   }
 
-  forceResync() {
-    if (this.connection && this.connection.forceResync) this.connection.forceResync();
+  forceResync(): boolean {
+    if (this.connection && this.connection.forceResync) return this.connection.forceResync();
+    return false;
+  }
+
+  manualSaveSnapshot(): boolean {
+    if (this.connection && this.connection.manualSaveSnapshot) return this.connection.manualSaveSnapshot();
+    return false;
   }
 
   private initializeConnection(): Connection {
@@ -182,6 +189,7 @@ export class Network {
     store.callback.onDisconnect = (peerId) => { if (this.callback.onDisconnect) this.callback.onDisconnect(peerId); }
     store.callback.onData = (peerId, data: any[]) => { if (this.callback.onData) this.callback.onData(peerId, data); }
     store.callback.onError = (peerId, errorType, errorMessage, errorObject) => { if (this.callback.onError) this.callback.onError(peerId, errorType, errorMessage, errorObject); }
+    store.callback.onPeerUnstable = (peerId, health) => { if (this.callback.onPeerUnstable) this.callback.onPeerUnstable(peerId, health); }
 
     if (0 < this.queue.size && this.sendInterval === null) this.sendInterval = setZeroTimeout(this.sendCallback);
 
@@ -190,6 +198,16 @@ export class Network {
 
   private async dynamicImport(mode: string = ''): Promise<ConnectionClass> {
     switch (mode) {
+      case 'websocket-relay':
+        return (await import(
+          /* webpackChunkName: "lib/backend/websocket-relay-connection" */
+          './websocket-relay-connection')
+        ).WebSocketRelayConnection;
+      case 'websocket-signaling':
+        return (await import(
+          /* webpackChunkName: "lib/backend/websocket-signaling-connection" */
+          './websocket-signaling-connection')
+        ).WebSocketSignalingConnection;
       case 'skyway2023':
       default:
         return (await import(

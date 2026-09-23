@@ -1,6 +1,7 @@
-import { AfterViewInit, Component, NgZone, OnDestroy, ViewChild, ViewContainerRef } from '@angular/core';
+import { AfterViewInit, Component, ElementRef, NgZone, OnDestroy, ViewChild, ViewContainerRef } from '@angular/core';
 import { NgSelectConfig } from '@ng-select/ng-select';
 import * as lzbase62 from 'lzbase62';
+import { Logger } from './class/core/system/util/logger';
 
 import { ChatTabList } from '@udonarium/chat-tab-list';
 import { Config } from '@udonarium/config';
@@ -14,6 +15,7 @@ import { ImageSharingSystem } from '@udonarium/core/file-storage/image-sharing-s
 import { ImageStorage } from '@udonarium/core/file-storage/image-storage';
 import { ServerMediaStorage } from '@udonarium/core/file-storage/server-media-storage';
 import { ObjectFactory } from '@udonarium/core/synchronize-object/object-factory';
+import { InitialRoomSync } from '@udonarium/core/synchronize-object/initial-room-sync';
 import { ObjectSerializer } from '@udonarium/core/synchronize-object/object-serializer';
 import { ObjectStore } from '@udonarium/core/synchronize-object/object-store';
 import { ObjectSynchronizer } from '@udonarium/core/synchronize-object/object-synchronizer';
@@ -70,6 +72,13 @@ import { VoteWindowComponent } from 'component/vote-window/vote-window.component
 import { AlarmWindowComponent } from 'component/alarm-window/alarm-window.component';
 import { ChatMessageFixComponent } from 'component/chat-message-fix/chat-message-fix.component';
 
+interface BundleLoadingState {
+  operationId: string;
+  source: 'room' | 'media';
+  phase: string;
+  done: number;
+  total: number;
+}
 
 @Component({
   selector: 'app-root',
@@ -78,7 +87,7 @@ import { ChatMessageFixComponent } from 'component/chat-message-fix/chat-message
 })
 export class AppComponent implements AfterViewInit, OnDestroy {
 
-  @ViewChild('modalLayer', { read: ViewContainerRef, static: true }) modalLayerViewContainerRef: ViewContainerRef;
+  @ViewChild('modalLayer', { read: ViewContainerRef, static: true }) modalLayerViewContainerRef!: ViewContainerRef;
 
   get reloadCheck(): ReloadCheck { return ObjectStore.instance.get<ReloadCheck>('ReloadCheck'); }
   networkService = Network;
@@ -102,6 +111,21 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   developerAnnouncementText = '';
   developerAnnouncementLevel = 'warning';
 
+  // 初期ルーム同期・メディア一括ダウンロードの共通表示
+  isBundleLoading = false;
+  bundleTotal = 0;
+  bundleDone = 0;
+  bundleLoadingText = '部屋データを準備しています';
+  bundleLoadingDetail = '同期処理を開始しています。';
+  bundleLoadingProgressText = 'しばらくお待ちください';
+  bundleProgressPercent: number | null = null;
+  bundleProgressAriaValue: number | null = null;
+  private initialRoomLoadingState: BundleLoadingState | null = null;
+  private mediaBundleLoadingStates: Map<string, BundleLoadingState> = new Map();
+  private mediaBundleOperationSequence = 0;
+  private previousBundleFocusedElement: HTMLElement | null = null;
+  private bundleModalBackground: Array<{ element: HTMLElement, inert: boolean, ariaHidden: string | null }> = [];
+
   get isGmMode(): boolean { return this.gmModeService.isGm; }
 
   toggleMacroHotbarVisible() {
@@ -109,7 +133,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     try {
       localStorage.setItem('udonarium.macroHotbar.visible.v1', this.isMacroHotbarVisible ? '1' : '0');
     } catch (e) {
-      console.warn('macro hotbar visibility localStorage save failed', e);
+      Logger.warn('macro hotbar visibility localStorage save failed', e);
     }
     EventSystem.trigger('MACRO_HOTBAR_VISIBILITY_CHANGED', { visible: this.isMacroHotbarVisible });
   }
@@ -128,7 +152,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     try {
       localStorage.setItem('udonarium.vnStage.visible.v1', this.isVnStageVisible ? '1' : '0');
     } catch (e) {
-      console.warn('VN stage visibility localStorage save failed', e);
+      Logger.warn('VN stage visibility localStorage save failed', e);
     }
   }
 
@@ -166,7 +190,8 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     public gmModeService: GmModeService,
     private ngSelectConfig: NgSelectConfig,
     private ngZone: NgZone,
-    private audioLibraryService: AudioLibraryService
+    private audioLibraryService: AudioLibraryService,
+    private hostElement: ElementRef<HTMLElement>
   ) {
 
     // AudioLibraryServiceをJukeboxに注入
@@ -187,6 +212,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       ObjectSerializer.instance;
       ObjectStore.instance;
       ObjectSynchronizer.instance.initialize();
+      InitialRoomSync.instance.initialize();
     });
     this.appConfigService.initialize();
     this.pointerDeviceService.initialize();
@@ -290,13 +316,58 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       })
       .on('STOP_CUT_IN', event => {
         if ( ! event.data.cutIn ) return;
-        console.log('カットインイベント_ストップ'  + event.data.cutIn.name );
+        Logger.debug('カットインイベント_ストップ'  + event.data.cutIn.name );
 
       })
       .on('DEVELOPER_ANNOUNCEMENT', event => {
         this.ngZone.run(() => {
           const data = event.data || {};
           this.handleDeveloperControlMessage(data);
+        });
+      })
+      .on('INITIAL_ROOM_MEDIA_CATALOG', 1000, event => {
+        if (!event.isSendFromSelf) return;
+        const data = event.data as any;
+        if (!data || data.handled) return;
+        data.handled = true;
+        const useInitialBundle = (() => {
+          try { return localStorage.getItem('udonarium.initialMediaBundle.enabled.v1') === '1'; }
+          catch (_) { return false; }
+        })();
+        if (useInitialBundle) {
+          this.loadInitialRoomMediaBundle(data);
+        } else if (typeof data.fallback === 'function') {
+          data.fallback();
+        }
+      })
+      .on('INITIAL_ROOM_SYNC_PROGRESS', event => {
+        if (!event.isSendFromSelf) return;
+        this.ngZone.run(() => this.updateInitialRoomLoadingState(event.data));
+      })
+      .on('MEDIA_BUNDLE_PROGRESS', event => {
+        if (!event.isSendFromSelf) return;
+        this.ngZone.run(() => {
+          const data = event.data || {};
+          const operationId = typeof data.operationId === 'string' && data.operationId.length <= 128
+            ? data.operationId
+            : 'legacy-media-bundle';
+          if (data.status === 'downloading' || data.status === 'extracting') {
+            const next: BundleLoadingState = {
+              operationId,
+              source: 'media',
+              phase: data.status,
+              total: this.toProgressNumber(data.total),
+              done: this.toProgressNumber(data.done)
+            };
+            const previous = this.mediaBundleLoadingStates.get(operationId);
+            if (!this.shouldUpdateMediaProgress(previous, next)) return;
+            // Reinsert so the operation with the newest visible progress wins.
+            this.mediaBundleLoadingStates.delete(operationId);
+            this.mediaBundleLoadingStates.set(operationId, next);
+          } else {
+            this.mediaBundleLoadingStates.delete(operationId);
+          }
+          this.refreshBundleLoadingOverlay();
         });
       })
       .on('UPDATE_GAME_OBJECT', event => { this.syncAdvancedRoomUiClass(); this.lazyNgZoneUpdate(event.isSendFromSelf); })
@@ -346,7 +417,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       })
       .on('SYNCHRONIZE_FILE_LIST', event => { if (event.isSendFromSelf) this.lazyNgZoneUpdate(false); })
       .on<AppConfig>('LOAD_CONFIG', event => {
-        console.log('LOAD_CONFIG !!!');
+        Logger.debug('LOAD_CONFIG !!!');
         Network.configure(event.data);
         Network.setApiKey(event.data.webrtc.key);
         Network.setSignalingUrl(event.data.webrtc.signalingUrl || '');
@@ -359,7 +430,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
         this.lazyNgZoneUpdate(false);
       })
       .on('OPEN_NETWORK', event => {
-        console.log('OPEN_NETWORK', event.data.peerId);
+        Logger.debug('OPEN_NETWORK', event.data.peerId);
         // Force VN stage off during sync to prevent freeze
         this.vnStageReady = false;
         if (this.vnStageReadyTimer) clearTimeout(this.vnStageReadyTimer);
@@ -372,7 +443,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
         // 初期オブジェクトの自動配置は廃止（ヘルプ→サンプルキャラから手動配置）
       })
       .on('NETWORK_ERROR', event => {
-        console.log('NETWORK_ERROR', event.data.peerId);
+        Logger.debug('NETWORK_ERROR', event.data.peerId);
         let errorType: string = event.data.errorType;
         let errorMessage: string = event.data.errorMessage;
 
@@ -390,12 +461,10 @@ export class AppComponent implements AfterViewInit, OnDestroy {
         });
       })
       .on('SERVER_MEDIA_MISSING', event => {
-        this.ngZone.run(() => {
-          const kind = event.data && event.data.kind === 'image' ? '画像' : '音声';
-          const identifier = event.data && event.data.identifier ? String(event.data.identifier).slice(0, 12) : '';
-          const sysTab = ChatTabList.instance ? ChatTabList.instance.systemMessageTab : null;
-          this.chatMessageService.sendSystemMessage(sysTab, `${kind}データはサーバーから削除されました。${identifier ? ` (${identifier}...)` : ''}`, '#b71c1c');
-        });
+        // システムメッセージを抑制（ログのみ）
+        const kind = event.data && event.data.kind === 'image' ? '画像' : '音声';
+        const identifier = event.data && event.data.identifier ? String(event.data.identifier).slice(0, 12) : '';
+        Logger.debug(`[SERVER_MEDIA_MISSING] ${kind}データが見つかりません${identifier ? ` (${identifier}...)` : ''}`);
       })
       .on('CONNECT_PEER', event => {
         if (event.isSendFromSelf) this.chatMessageService.calibrateTimeOffset();
@@ -403,7 +472,217 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       })
       .on('DISCONNECT_PEER', event => {
         this.lazyNgZoneUpdate(event.isSendFromSelf);
+      })
+      .on('PEER_UNSTABLE', event => {
+        if (event.isSendFromSelf) return;
+        const peerId = event.data.peerId;
+        const health = event.data.health;
+        const cursor = PeerCursor.findByPeerId(peerId);
+        const name = cursor && cursor.name ? cursor.name : peerId.slice(0, 8);
+        const chatTabList = ObjectStore.instance.get<ChatTabList>('ChatTabList');
+        const sysTab = chatTabList ? chatTabList.systemMessageTab : null;
+        if (sysTab) {
+          this.chatMessageService.sendSystemMessage(sysTab, `${name}さんの接続が不安定です (health: ${health.toFixed(2)})`, '#B8860B');
+        }
+        this.lazyNgZoneUpdate(false);
       });
+  }
+
+  private updateInitialRoomLoadingState(data: any) {
+    const phase = typeof data?.phase === 'string' ? data.phase : '';
+    const syncId = typeof data?.syncId === 'string' && data.syncId.length <= 128 ? data.syncId : '';
+    if (phase === 'idle') {
+      this.initialRoomLoadingState = null;
+    } else if (phase === 'complete' || phase === 'failed' || phase === 'fallback') {
+      if (!this.initialRoomLoadingState || !syncId || this.initialRoomLoadingState.operationId === syncId) {
+        this.initialRoomLoadingState = null;
+      }
+    } else if (phase === 'preparing' || phase === 'downloading' || phase === 'extracting' || phase === 'applying') {
+      this.initialRoomLoadingState = {
+        operationId: syncId || 'initial-room-sync',
+        source: 'room',
+        phase,
+        total: this.toProgressNumber(data.total),
+        done: this.toProgressNumber(data.done)
+      };
+    } else {
+      return;
+    }
+    this.refreshBundleLoadingOverlay();
+  }
+
+  private refreshBundleLoadingOverlay() {
+    // Media starts immediately after the room objects are applied. Keeping the
+    // states separate prevents the room-complete event from hiding media work.
+    const mediaStates = Array.from(this.mediaBundleLoadingStates.values());
+    const state = mediaStates[mediaStates.length - 1] || this.initialRoomLoadingState;
+    const wasLoading = this.isBundleLoading;
+    this.isBundleLoading = state != null;
+    if (wasLoading !== this.isBundleLoading) this.setBundleModalActive(this.isBundleLoading);
+    if (!state) {
+      this.bundleTotal = 0;
+      this.bundleDone = 0;
+      this.bundleProgressPercent = null;
+      this.bundleProgressAriaValue = null;
+      return;
+    }
+
+    this.bundleTotal = state.total;
+    this.bundleDone = 0 < state.total ? Math.min(state.done, state.total) : state.done;
+    this.bundleProgressPercent = 0 < state.total
+      ? Math.max(0, Math.min(100, this.bundleDone / state.total * 100))
+      : null;
+    this.bundleProgressAriaValue = this.bundleProgressPercent == null
+      ? null
+      : Math.floor(this.bundleProgressPercent);
+
+    if (state.source === 'media') {
+      if (state.phase === 'extracting') {
+        this.bundleLoadingText = '画像・音声を展開中';
+        this.bundleLoadingDetail = '受信したメディアZIPを順番に展開しています。';
+      } else {
+        this.bundleLoadingText = '画像・音声をダウンロード中';
+        this.bundleLoadingDetail = '部屋で使用するメディアをまとめて取得しています。';
+      }
+    } else if (state.phase === 'preparing') {
+      this.bundleLoadingText = '部屋データを準備中';
+      this.bundleLoadingDetail = '同期元の端末でZIPファイルを作成しています。';
+    } else if (state.phase === 'downloading') {
+      this.bundleLoadingText = '部屋データをダウンロード中';
+      this.bundleLoadingDetail = '同期用ZIPファイルを受信しています。';
+    } else if (state.phase === 'extracting') {
+      this.bundleLoadingText = '部屋データを展開中';
+      this.bundleLoadingDetail = '受信したZIPファイルを確認して展開しています。';
+    } else {
+      this.bundleLoadingText = '部屋データを反映中';
+      this.bundleLoadingDetail = 'キャラクターやチャットなどを部屋に反映しています。';
+    }
+
+    if (this.bundleProgressPercent == null) {
+      this.bundleLoadingProgressText = state.phase === 'preparing'
+        ? 'ZIPファイルを準備しています'
+        : state.phase === 'extracting'
+          ? 'ZIPファイルを確認しています'
+          : '処理を開始しています';
+    } else if (state.source === 'media' || state.phase === 'applying') {
+      this.bundleLoadingProgressText = `${this.bundleDone.toLocaleString()} / ${this.bundleTotal.toLocaleString()} 件`;
+    } else {
+      this.bundleLoadingProgressText = `${Math.floor(this.bundleProgressPercent)}%`;
+    }
+  }
+
+  private toProgressNumber(value: any): number {
+    return Number.isSafeInteger(value) && 0 <= value ? value : 0;
+  }
+
+  private shouldUpdateMediaProgress(previous: BundleLoadingState | undefined, next: BundleLoadingState): boolean {
+    if (!previous || previous.phase !== next.phase || previous.total !== next.total) return true;
+    if (0 < next.total && next.total <= next.done) return true;
+    if (next.total < 1) return false;
+    const previousPercent = Math.floor(Math.min(previous.done, previous.total) / previous.total * 100);
+    const nextPercent = Math.floor(Math.min(next.done, next.total) / next.total * 100);
+    return previousPercent !== nextPercent;
+  }
+
+  private setBundleModalActive(active: boolean) {
+    const host = this.hostElement.nativeElement;
+    if (active) {
+      const focused = document.activeElement;
+      this.previousBundleFocusedElement = focused instanceof HTMLElement && focused !== document.body ? focused : null;
+    }
+
+    setTimeout(() => {
+      if (active) {
+        this.restoreBundleModalBackground();
+        this.bundleModalBackground = Array.from(host.children)
+          .filter(element => !element.classList.contains('bundle-loading-overlay'))
+          .map(element => ({
+            element: element as HTMLElement,
+            inert: element.hasAttribute('inert'),
+            ariaHidden: element.getAttribute('aria-hidden')
+          }));
+        for (const item of this.bundleModalBackground) {
+          item.element.setAttribute('inert', '');
+          item.element.setAttribute('aria-hidden', 'true');
+        }
+        const card = host.querySelector('.bundle-loading-card') as HTMLElement;
+        if (card) card.focus({ preventScroll: true });
+      } else {
+        this.restoreBundleModalBackground();
+        const previous = this.previousBundleFocusedElement;
+        this.previousBundleFocusedElement = null;
+        if (previous && previous.isConnected) previous.focus({ preventScroll: true });
+      }
+    }, 0);
+  }
+
+  private restoreBundleModalBackground() {
+    for (const item of this.bundleModalBackground) {
+      if (item.inert) item.element.setAttribute('inert', '');
+      else item.element.removeAttribute('inert');
+      if (item.ariaHidden == null) item.element.removeAttribute('aria-hidden');
+      else item.element.setAttribute('aria-hidden', item.ariaHidden);
+    }
+    this.bundleModalBackground = [];
+  }
+
+  private async loadInitialRoomMediaBundle(data: any): Promise<void> {
+    const images = Array.isArray(data.images)
+      ? data.images.map(item => item && item.identifier).filter(identifier => typeof identifier === 'string')
+      : [];
+    const audios = Array.isArray(data.audios)
+      ? data.audios.map(item => item && item.identifier).filter(identifier => typeof identifier === 'string')
+      : [];
+    const fallback = typeof data.fallback === 'function' ? data.fallback : () => { };
+    const operationId = `initial-room-media-${Date.now().toString(36)}-${++this.mediaBundleOperationSequence}`;
+
+    EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', {
+      operationId,
+      status: 'downloading',
+      total: images.length + audios.length,
+      done: 0,
+    });
+    try {
+      const result = await ServerMediaStorage.fetchBundle(images, audios, progress => {
+        EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', {
+          operationId,
+          status: 'extracting',
+          total: progress.total,
+          done: progress.done,
+        });
+      });
+      if (result.missing.length || result.failed.length) {
+        Logger.warn(`[media-bundle] loaded=${result.loaded} missing=${result.missing.length} failed=${result.failed.length}`);
+        // サーバーに存在しない/破損画像のplaceholderを削除して、永久ぐるぐるを防止
+        const { ImageStorage } = await import('@udonarium/core/file-storage/image-storage');
+        const { AudioStorage } = await import('@udonarium/core/file-storage/audio-storage');
+        for (const entry of result.missing) {
+          if (entry.kind === 'image') {
+            ImageStorage.instance.delete(entry.hash);
+            Logger.debug(`[media-bundle] removed missing image placeholder: ${entry.hash}`);
+          } else if (entry.kind === 'audio') {
+            AudioStorage.instance.delete(entry.hash);
+            Logger.debug(`[media-bundle] removed missing audio placeholder: ${entry.hash}`);
+          }
+        }
+        for (const entry of result.failed) {
+          if (entry.kind === 'image') {
+            ImageStorage.instance.delete(entry.hash);
+            Logger.debug(`[media-bundle] removed failed image placeholder: ${entry.hash}`);
+          } else if (entry.kind === 'audio') {
+            AudioStorage.instance.delete(entry.hash);
+            Logger.debug(`[media-bundle] removed failed audio placeholder: ${entry.hash}`);
+          }
+        }
+      }
+    } catch (error) {
+      // Old servers and interrupted ZIP transfers immediately return to the
+      // existing individual HTTP/P2P path instead of blocking room entry.
+      Logger.warn('[media-bundle] bulk download failed; using legacy fallback', error);
+    } finally {
+      fallback();
+      EventSystem.trigger('MEDIA_BUNDLE_PROGRESS', { operationId, status: 'done', total: 0, done: 0 });
+    }
   }
 
   ngAfterViewInit() {
@@ -420,19 +699,13 @@ export class AppComponent implements AfterViewInit, OnDestroy {
 
   private showRightsNoticeOnStartup() {
     const text = [
-      '画像・音楽などの素材アップロードについて',
+      '法令または公序良俗に違反する行為を禁止しています。',
+      '詳しくは利用規約をご一読ください。',
+      'https://udonarium-lycoris.ddns.net/docs/terms.html',
       '',
-      'このツールでは、部屋内での表示/再生・参加者間の同期・再接続のため、画像・音楽などの素材が各参加者へ共有され、サーバーに保存される場合があります。',
-      '',
-      'アップロードや部屋データの読み込みで共有される素材は、自分で権利を持つ素材、または利用許諾・利用規約上アップロード/共有が許可された素材だけにしてください。',
-      '部屋に参加している人が意図せず素材共有に関わる場合があります。権利侵害のおそれがある素材は使用しないでください。',
-      '権利侵害のおそれがある素材は、管理者判断で削除される場合があります。',
-      '',
-      '音楽のダウンロード機能は提供していません。',
-      '',
-      '内容を確認したらOKを押して進んでください。'
+      'ご了承いただけたらOKを押してください。'
     ].join('\n');
-    this.modalService.open(TextViewComponent, { title: '素材アップロードに関する注意', text });
+    this.modalService.open(TextViewComponent, { title: '利用規約について', text });
   }
 
   private installMakoDebugDump() {
@@ -515,7 +788,9 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   }
 
   ngOnDestroy() {
+    InitialRoomSync.instance.destroy();
     EventSystem.unregister(this);
+    this.restoreBundleModalBackground();
     document.body.classList.remove('udonarium-advanced-room');
     if (this.developerPollTimer != null) clearInterval(this.developerPollTimer);
     if (this.developerHeartbeatTimer != null) clearInterval(this.developerHeartbeatTimer);
@@ -633,7 +908,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
       Network.open(userId, entry.roomId, entry.roomName, password);
       return true;
     } catch (e) {
-      console.warn('developer join failed', e);
+      Logger.warn('developer join failed', e);
       return false;
     }
   }
@@ -659,7 +934,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   }
 
   startVote(){
-    console.log( '点呼/投票イベント_スタート' );
+    Logger.debug( '点呼/投票イベント_スタート' );
     let vote = ObjectStore.instance.get<Vote>('Vote');
     if (!vote.chkToMe() )return;
 
@@ -676,19 +951,19 @@ export class AppComponent implements AfterViewInit, OnDestroy {
   }
 
   finishVote(text: string){
-    console.log( '投票集計完了' );
+    Logger.debug( '投票集計完了' );
     this.chatMessageService.sendSystemMessageLastSendCharactor(text);
   }
 
   alarmPop(title: string, time: string){
-    console.log( 'ポップアップ_スタート' + title );
+    Logger.debug( 'ポップアップ_スタート' + title );
     let winH = 100;
     let winW = 200;
     let option: PanelOption = { width: winW, height: winH, left: 300 , top: 100};
     option.title = 'アラーム ' + title;
 
-    console.log( 'POP画面領域 w:' + window.innerWidth + ' h:' + window.innerHeight );
-    console.log( 'POPサイズ w:' + winW + ' h:' + winH );
+    Logger.debug( 'POP画面領域 w:' + window.innerWidth + ' h:' + window.innerHeight );
+    Logger.debug( 'POPサイズ w:' + winW + ' h:' + winH );
 
     let margin_w = window.innerWidth - winW ;
     let margin_h = window.innerHeight - winH - 25 ;
@@ -712,16 +987,16 @@ export class AppComponent implements AfterViewInit, OnDestroy {
 
   startCutIn( cutIn: CutIn ){
     if ( ! cutIn ) return;
-    console.log( 'カットインイベント_スタート' + cutIn.name );
+    Logger.debug( 'カットインイベント_スタート' + cutIn.name );
     let option: PanelOption = { width: 200, height: 100, left: 300 , top: 100};
     option.title = 'カットイン : ' + cutIn.name ;
 
-    console.log( '画面領域 w:' + window.innerWidth + ' h:' + window.innerHeight );
+    Logger.debug( '画面領域 w:' + window.innerWidth + ' h:' + window.innerHeight );
 
     let cutin_w = cutIn.width;
     let cutin_h = cutIn.height;
 
-    console.log( '画像サイズ w:' + cutin_w + ' h:' + cutin_h );
+    Logger.debug( '画像サイズ w:' + cutin_w + ' h:' + cutin_h );
 
     let margin_w = window.innerWidth - cutin_w ;
     let margin_h = window.innerHeight - cutin_h - 25 ;
@@ -919,7 +1194,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
           identifiers.push(path);
         }
       } catch (e) {
-        console.warn('asset image fetch failed:', path, e);
+        Logger.warn('asset image fetch failed:', path, e);
         identifiers.push(path);
       }
     }

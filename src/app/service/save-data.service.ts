@@ -10,6 +10,7 @@ import { AudioStorage } from '@udonarium/core/file-storage/audio-storage';
 import { ImageFile, ImageState } from '@udonarium/core/file-storage/image-file';
 import { ImageStorage } from '@udonarium/core/file-storage/image-storage';
 import { MimeType } from '@udonarium/core/file-storage/mime-type';
+import { ServerMediaStorage } from '@udonarium/core/file-storage/server-media-storage';
 import { GameObject } from '@udonarium/core/synchronize-object/game-object';
 import { PromiseQueue } from '@udonarium/core/system/util/promise-queue';
 import { XmlUtil } from '@udonarium/core/system/util/xml-util';
@@ -24,6 +25,9 @@ import { ImageTagList } from '@udonarium/image-tag-list';
 import { Jukebox } from '@udonarium/Jukebox';
 import { ObjectStore } from '@udonarium/core/synchronize-object/object-store';
 //
+import { ModalService } from './modal.service';
+import { TextViewComponent } from '../component/text-view/text-view.component';
+
 type UpdateCallback = (percent: number) => void;
 
 @Injectable({
@@ -33,14 +37,15 @@ export class SaveDataService {
   private static queue: PromiseQueue = new PromiseQueue('SaveDataServiceQueue');
 
   constructor(
-    private ngZone: NgZone
+    private ngZone: NgZone,
+    private modalService: ModalService
   ) { }
 
   saveRoomAsync(fileName: string = 'ルームデータ', updateCallback?: UpdateCallback): Promise<void> {
     return SaveDataService.queue.add((resolve, reject) => resolve(this._saveRoomAsync(fileName, updateCallback)));
   }
 
-  private _saveRoomAsync(fileName: string = 'ルームデータ', updateCallback?: UpdateCallback): Promise<void> {
+  private async _saveRoomAsync(fileName: string = 'ルームデータ', updateCallback?: UpdateCallback): Promise<void> {
     let files: File[] = [];
     let roomXml = this.convertToXml(new Room());
     let chatXml = this.convertToXml(ChatTabList.instance);
@@ -60,11 +65,16 @@ export class SaveDataService {
     let images: ImageFile[] = [];
     images = images.concat(this.searchImageFiles(roomXml));
     images = images.concat(this.searchImageFiles(chatXml));
+    await this.ensureImagesComplete(images);
+    let incompleteCount = 0;
     for (const image of images) {
       if (image.state === ImageState.COMPLETE) {
         files.push(new File([image.blob], image.identifier + '.' + MimeType.extension(image.blob.type), { type: image.blob.type }));
+      } else {
+        incompleteCount++;
       }
     }
+    this.warnIncompleteImages(incompleteCount);
 
     let imageTagXml = this.convertToXml(ImageTagList.create(images));
     files.push(new File([imageTagXml], 'imagetag.xml', { type: 'text/plain' }));
@@ -76,7 +86,7 @@ export class SaveDataService {
     return SaveDataService.queue.add((resolve, reject) => resolve(this._saveGameObjectAsync(gameObject, fileName, updateCallback)));
   }
 
-  private _saveGameObjectAsync(gameObject: GameObject, fileName: string = 'xml_data', updateCallback?: UpdateCallback): Promise<void> {
+  private async _saveGameObjectAsync(gameObject: GameObject, fileName: string = 'xml_data', updateCallback?: UpdateCallback): Promise<void> {
     let files: File[] = [];
     let xml: string = this.convertToXml(gameObject);
 
@@ -85,11 +95,16 @@ export class SaveDataService {
 //    files = files.concat(this.searchImageFiles(xml));
     let images: ImageFile[] = [];
     images = images.concat(this.searchImageFiles(xml));
+    await this.ensureImagesComplete(images);
+    let incompleteCount = 0;
     for (const image of images) {
       if (image.state === ImageState.COMPLETE) {
         files.push(new File([image.blob], image.identifier + '.' + MimeType.extension(image.blob.type), { type: image.blob.type }));
+      } else {
+        incompleteCount++;
       }
     }
+    this.warnIncompleteImages(incompleteCount);
 
     let imageTagXml = this.convertToXml(ImageTagList.create(images));
     files.push(new File([imageTagXml], 'imagetag.xml', { type: 'text/plain' }));
@@ -105,6 +120,63 @@ export class SaveDataService {
       progresPercent = percent;
       this.ngZone.run(() => updateCallback(progresPercent));
     });
+  }
+
+  /**
+   * ZIP保存前に、未取得画像をサーバーまたはURLから取得して保存漏れを防ぐ。
+   * 大量画像でも待ちすぎないよう、サーバーfetchは16並列バッチ。
+   */
+  private async ensureImagesComplete(images: ImageFile[]): Promise<void> {
+    const seen = new Set<string>();
+    const targets: ImageFile[] = [];
+    for (const image of images) {
+      if (!image || image.state === ImageState.COMPLETE) continue;
+      if (seen.has(image.identifier)) continue;
+      seen.add(image.identifier);
+      targets.push(image);
+    }
+    if (targets.length < 1) return;
+
+    const BATCH_SIZE = 16;
+    for (let i = 0; i < targets.length; i += BATCH_SIZE) {
+      const batch = targets.slice(i, i + BATCH_SIZE);
+      await Promise.all(batch.map(async image => {
+        try {
+          // ハッシュidentifierの場合はサーバーから取得
+          if (/^[a-f0-9]{64}$/i.test(image.identifier || '')) {
+            const result = await ServerMediaStorage.fetchImage(image.identifier);
+            if (result.status === 'ok') {
+              ImageStorage.instance.add(result.file);
+            }
+            return;
+          }
+          // URL画像の場合はfetchしてblob化
+          if (image.url && image.state === ImageState.URL) {
+            const response = await fetch(image.url);
+            if (response.ok) {
+              const blob = await response.blob();
+              const newImage = await ImageFile.createAsync(blob, image.name || image.identifier);
+              // 元のidentifierを維持して更新
+              const ctx = newImage.toContext();
+              ctx.identifier = image.identifier;
+              image.apply(ctx);
+            }
+          }
+        } catch (e) {
+          // silent
+        }
+      }));
+    }
+  }
+
+  /**
+   * サーバー/ローカルキャッシュに無く、取得できなかった画像がZIP保存で漏れた場合に警告表示。
+   * P2P救済が間に合わなかった画像は保存データに含まれない。
+   */
+  private warnIncompleteImages(incompleteCount: number): void {
+    if (incompleteCount < 1) return;
+    const message = `${incompleteCount}枚の画像が取得できず、保存データに含まれませんでした。\nサーバーまたは他の参加者から取得できる場合がありますが、このままでは保存データから復元できません。`;
+    this.modalService.open(TextViewComponent, { title: '画像の保存漏れ', text: message });
   }
 
   private convertToXml(gameObject: GameObject): string {
